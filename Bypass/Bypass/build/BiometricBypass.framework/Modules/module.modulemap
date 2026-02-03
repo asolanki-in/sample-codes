@@ -1,0 +1,7 @@
+framework module BiometricBypass {
+    umbrella header "BiometricHook.h"
+    umbrella header "KeychainHook.h"
+
+    export *
+    module * { export * }
+}

@@ -1,0 +1,10 @@
+# Plain-text flow: one natural-language step per line.
+# Lines starting with '#' and blank lines are ignored.
+# Run with:  mobile-agent run flows/quickstart.txt
+Tap on Continue
+Enter username as hello
+Enter date of birth
+Tap new button
+Tap on close
+Go back
+Toggle switch of activity

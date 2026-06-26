@@ -1,0 +1,26 @@
+# Example end-to-end flow.
+#
+# Run with:
+#   mobile-agent run flows/example.flow.yaml
+#
+# Steps are plain natural language - the agent figures out the selectors and
+# gestures. `optional` steps don't abort the flow on failure; `retries` re-runs
+# a step up to N extra times before it counts as failed.
+name: signup-and-profile
+platform: android
+
+# App under test (optional - can also come from .env or --app-package).
+app:
+  appPackage: com.example.app
+  appActivity: .MainActivity
+
+steps:
+  - Tap on Continue
+  - text: Enter username as hello
+    retries: 1
+  - Enter date of birth
+  - Tap new button
+  - Toggle switch of activity
+  - text: Tap on close
+    optional: true
+  - Go back

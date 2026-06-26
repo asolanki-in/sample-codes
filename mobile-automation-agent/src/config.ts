@@ -24,6 +24,29 @@ function parseArgsArray(raw: string | undefined, fallback: string[]): string[] {
   return raw.split(/\s+/).filter(Boolean);
 }
 
+/** Ensure an endpoint path starts with exactly one leading slash. */
+function normaliseEndpoint(endpoint: string): string {
+  const trimmed = endpoint.trim();
+  if (trimmed === "") return "/sse";
+  return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+}
+
+/** Parse a JSON object of HTTP headers, ignoring anything malformed. */
+function parseHeaders(raw: string | undefined): Record<string, string> | undefined {
+  if (!raw || raw.trim() === "") return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(parsed)) out[k] = String(v);
+      return Object.keys(out).length > 0 ? out : undefined;
+    }
+  } catch {
+    // ignore malformed header JSON
+  }
+  return undefined;
+}
+
 const boolFromString = z
   .string()
   .transform((v) => v.trim().toLowerCase())
@@ -34,6 +57,21 @@ const EnvSchema = z.object({
   ANTHROPIC_API_KEY: z.string().min(1, "ANTHROPIC_API_KEY is required"),
   ANTHROPIC_MODEL: z.string().default("claude-sonnet-4-6"),
   ANTHROPIC_MAX_TOKENS: z.coerce.number().int().positive().default(4096),
+
+  // ---- appium-mcp transport ----
+  // We talk to appium-mcp over streamable HTTP (httpStream) by default.
+  MCP_TRANSPORT: z.enum(["httpStream", "stdio"]).default("httpStream"),
+  // Full URL of a running httpStream server (overrides host/port if set).
+  MCP_HTTP_URL: z.string().url().optional(),
+  MCP_HTTP_HOST: z.string().default("127.0.0.1"),
+  MCP_HTTP_PORT: z.coerce.number().int().positive().default(8080),
+  // appium-mcp serves the streamable HTTP endpoint at /sse.
+  MCP_HTTP_ENDPOINT: z.string().default("/sse"),
+  // Optional JSON object of extra HTTP headers (e.g. auth).
+  MCP_HTTP_HEADERS: z.string().optional(),
+  // Spawn the appium-mcp server locally instead of connecting to an existing one.
+  MCP_AUTOSTART: boolFromString.default(true),
+  MCP_CONNECT_TIMEOUT_MS: z.coerce.number().int().positive().default(60_000),
 
   APPIUM_MCP_COMMAND: z.string().default("npx"),
   APPIUM_MCP_ARGS: z.string().optional(),
@@ -63,6 +101,18 @@ export interface AppConfiguration {
     maxTokens: number;
   };
   appiumMcp: {
+    transport: "httpStream" | "stdio";
+    /** Resolved streamable-HTTP URL (httpStream transport only). */
+    url: string;
+    /** HTTP port the server listens on (used for autostart + URL). */
+    port: number;
+    /** Optional extra HTTP headers for the httpStream connection. */
+    headers?: Record<string, string>;
+    /** Spawn the appium-mcp server locally before connecting. */
+    autostart: boolean;
+    /** How long to wait for the server to accept connections. */
+    connectTimeoutMs: number;
+    /** Command + base args used to launch appium-mcp. */
     command: string;
     args: string[];
     /** Extra env passed through to the appium-mcp child process. */
@@ -108,6 +158,14 @@ export function loadConfig(): AppConfiguration {
       maxTokens: env.ANTHROPIC_MAX_TOKENS,
     },
     appiumMcp: {
+      transport: env.MCP_TRANSPORT,
+      url:
+        env.MCP_HTTP_URL ??
+        `http://${env.MCP_HTTP_HOST}:${env.MCP_HTTP_PORT}${normaliseEndpoint(env.MCP_HTTP_ENDPOINT)}`,
+      port: env.MCP_HTTP_PORT,
+      headers: parseHeaders(env.MCP_HTTP_HEADERS),
+      autostart: env.MCP_AUTOSTART,
+      connectTimeoutMs: env.MCP_CONNECT_TIMEOUT_MS,
       command: env.APPIUM_MCP_COMMAND,
       args: parseArgsArray(env.APPIUM_MCP_ARGS, ["appium-mcp@latest"]),
       env: passthroughEnv,

@@ -32,6 +32,12 @@ export async function runFlow(
   const startedAt = new Date();
 
   const mcp = new AppiumMcpClient({
+    transport: config.appiumMcp.transport,
+    url: config.appiumMcp.url,
+    port: config.appiumMcp.port,
+    headers: config.appiumMcp.headers,
+    autostart: config.appiumMcp.autostart,
+    connectTimeoutMs: config.appiumMcp.connectTimeoutMs,
     command: config.appiumMcp.command,
     args: config.appiumMcp.args,
     env: config.appiumMcp.env,

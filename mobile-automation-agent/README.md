@@ -31,9 +31,9 @@ simulators, and real devices).
         │  OBSERVE→PLAN→ACT→VERIFY│                          │
         └────────────┬───────────┘                          │
                      │ MCP tool calls                 Anthropic API
-                     ▼                                       │
+                     ▼  (streamable HTTP)                    │
         ┌────────────────────────┐                          │
-        │   appium-mcp (stdio)    │──────────────────────────┘
+        │  appium-mcp (httpStream)│──────────────────────────┘
         └────────────┬───────────┘
                      │ WebDriver
                      ▼
@@ -47,6 +47,11 @@ simulators, and real devices).
   tools (`appium_find_element`, `appium_gesture`, `appium_set_value`,
   `appium_get_page_source`, `appium_screenshot`, …) until it reports the step
   done.
+- **Streamable HTTP transport** — the agent talks to appium-mcp over
+  `httpStream` (FastMCP's streamable-HTTP), not stdio. The server can be
+  auto-spawned locally (`appium-mcp --httpStream --port=8080`, endpoint `/sse`)
+  or you can attach to a shared/remote server via `MCP_HTTP_URL`. Set
+  `MCP_TRANSPORT=stdio` to fall back to stdio.
 - **Tools are discovered dynamically** from appium-mcp, so new server
   capabilities are available automatically.
 - **Vision** — a screenshot is attached at the start of every step; older
@@ -117,6 +122,22 @@ Useful flags: `--platform`, `--device`, `--app-package`, `--bundle-id`,
 Exit code is `0` when the flow passes, `1` when any required step fails, `2` on
 configuration/flow errors — convenient for CI.
 
+## Transport (httpStream)
+
+The agent connects to appium-mcp over **streamable HTTP** by default.
+
+- **Auto-spawn (default):** with `MCP_AUTOSTART=true` the agent launches
+  `npx appium-mcp@latest --httpStream --port=<MCP_HTTP_PORT>` and connects to
+  `http://<host>:<port>/sse`, retrying until the server is ready
+  (`MCP_CONNECT_TIMEOUT_MS`). It also stops the server on exit.
+- **Attach to a running server:** start it yourself —
+  `npx appium-mcp@latest --httpStream --port=8080` — then set
+  `MCP_AUTOSTART=false` and `MCP_HTTP_URL=http://127.0.0.1:8080/sse` (handy for a
+  shared device host or a containerised Appium grid). Extra headers (e.g. auth)
+  go in `MCP_HTTP_HEADERS` as JSON.
+- **stdio fallback:** set `MCP_TRANSPORT=stdio` to spawn appium-mcp and speak
+  over its stdio instead.
+
 ## Flow formats
 
 **YAML / JSON** (structured):
@@ -163,8 +184,10 @@ flows/                  example flows
 
 - **Why appium-mcp instead of driving WebdriverIO directly?** It gives a stable,
   well-tested tool surface (gestures, alerts, app lifecycle, clipboard, etc.)
-  over a single stdio process, and lets the agent pick up new tools without code
-  changes — the same integration model mobilerun uses with its Portal tools.
+  over a streamable-HTTP server, and lets the agent pick up new tools without
+  code changes — the same integration model mobilerun uses with its Portal
+  tools. HTTP transport also makes it easy to run the device host separately
+  from the agent (containers, CI, a shared Appium grid).
 - **Context control.** Page-source XML is truncated and all but the last couple
   of screenshots are dropped from history, so long flows don't blow the context
   window or run away on cost.

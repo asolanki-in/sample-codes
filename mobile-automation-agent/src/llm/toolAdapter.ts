@@ -16,6 +16,29 @@ import { STEP_COMPLETE_TOOL } from "../agent/prompts.js";
 export type AnthropicTool = Anthropic.Tool;
 export type ToolResultContentBlock = Anthropic.ToolResultBlockParam["content"];
 
+/** Name of the local tool that returns the compact UI snapshot. */
+export const INSPECT_SCREEN_TOOL = "inspect_screen";
+
+/**
+ * Local (agent-side) tool that returns a compact, token-efficient list of the
+ * actionable on-screen elements with precomputed locators. Strongly preferred
+ * over raw `appium_get_page_source` for finding elements.
+ */
+export const inspectScreenTool: AnthropicTool = {
+  name: INSPECT_SCREEN_TOOL,
+  description:
+    "Return a compact JSON list of the actionable elements currently on screen. " +
+    "Each element has: ref, role, text, id, acc (accessibility id), val, state " +
+    "(flags like clickable/checked/editable/disabled), c ([x,y] center for a " +
+    "coordinate tap), and by (a ready-to-use {strategy, selector} for " +
+    "appium_find_element). Prefer this over appium_get_page_source when locating " +
+    "elements — it is far cheaper and the `by` locator is the recommended one.",
+  input_schema: {
+    type: "object",
+    properties: {},
+  },
+};
+
 /** The synthetic tool the agent calls to end a step. */
 export const reportStepResultTool: AnthropicTool = {
   name: STEP_COMPLETE_TOOL,
@@ -50,6 +73,7 @@ export function buildAnthropicTools(mcpTools: McpToolDefinition[]): AnthropicToo
     description: t.description,
     input_schema: normaliseSchema(t.inputSchema),
   }));
+  tools.push(inspectScreenTool);
   tools.push(reportStepResultTool);
   return tools;
 }

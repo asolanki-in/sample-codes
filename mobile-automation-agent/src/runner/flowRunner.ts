@@ -67,6 +67,7 @@ export async function runFlow(
       maxTokens: config.anthropic.maxTokens,
       maxStepIterations: config.agent.maxStepIterations,
       visionEnabled: config.agent.visionEnabled,
+      platform,
       logger,
     });
 

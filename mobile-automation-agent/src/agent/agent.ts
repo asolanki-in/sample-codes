@@ -16,12 +16,17 @@ import type { AppiumMcpClient } from "../mcp/appiumClient.js";
 import type { ToolCallRecord } from "../types.js";
 import {
   type AnthropicTool,
+  INSPECT_SCREEN_TOOL,
   toToolResultContent,
 } from "../llm/toolAdapter.js";
+import { buildSnapshot, renderSnapshot, SNAPSHOT_MARKER } from "../mcp/uiSnapshot.js";
+import type { Platform } from "../types.js";
 import { STEP_COMPLETE_TOOL, buildStepInstruction } from "./prompts.js";
 
 /** How many recent screenshots to retain in history. */
 const SCREENSHOTS_TO_KEEP = 2;
+/** How many recent UI snapshots to retain in history. */
+const SNAPSHOTS_TO_KEEP = 2;
 
 type MessageParam = Anthropic.MessageParam;
 type ContentBlockParam = Anthropic.ContentBlockParam;
@@ -35,6 +40,7 @@ export interface AgentDeps {
   maxTokens: number;
   maxStepIterations: number;
   visionEnabled: boolean;
+  platform: Platform;
   logger: Logger;
 }
 
@@ -58,10 +64,13 @@ export class MobileAgent {
   async runStep(stepText: string, index: number, total: number): Promise<RunStepOutcome> {
     const toolCalls: ToolCallRecord[] = [];
 
-    // OBSERVE: seed the step with a fresh screenshot for visual grounding.
+    // OBSERVE: seed the step with a fresh compact UI snapshot (for precise
+    // selectors) and, when enabled, a screenshot (for visual grounding).
     const stepContent: ContentBlockParam[] = [
       { type: "text", text: buildStepInstruction(stepText, index, total) },
     ];
+    const snapshot = await this.captureSnapshot();
+    if (snapshot) stepContent.push({ type: "text", text: snapshot });
     if (this.deps.visionEnabled) {
       const shot = await this.captureScreenshot();
       if (shot) stepContent.push(shot);
@@ -71,7 +80,7 @@ export class MobileAgent {
     let nudged = false;
 
     for (let iteration = 1; iteration <= this.deps.maxStepIterations; iteration++) {
-      this.pruneScreenshots();
+      this.pruneObservations();
 
       const response = await this.deps.anthropic.messages.create({
         model: this.deps.model,
@@ -143,6 +152,23 @@ export class MobileAgent {
           continue;
         }
 
+        if (use.name === INSPECT_SCREEN_TOOL) {
+          const started = Date.now();
+          const snapshot = (await this.captureSnapshot()) ?? "UI_SNAPSHOT (unavailable)";
+          toolCalls.push({
+            tool: INSPECT_SCREEN_TOOL,
+            input: {},
+            ok: true,
+            durationMs: Date.now() - started,
+          });
+          toolResults.push({
+            type: "tool_result",
+            tool_use_id: use.id,
+            content: [{ type: "text", text: snapshot }],
+          });
+          continue;
+        }
+
         const record = await this.executeTool(use);
         toolCalls.push(record.record);
         toolResults.push(record.block);
@@ -199,6 +225,26 @@ export class MobileAgent {
     return { record, block };
   }
 
+  /**
+   * Fetch the page source and convert it into the compact UI snapshot text.
+   * Returns null if the source can't be read (e.g. no active session yet).
+   */
+  private async captureSnapshot(): Promise<string | null> {
+    const result = await this.deps.mcp.callTool("appium_get_page_source", {});
+    if (result.isError || !result.text || result.text.trim() === "") {
+      this.log.debug(`page source unavailable: ${result.text.slice(0, 120)}`);
+      return null;
+    }
+    try {
+      const snapshot = buildSnapshot(result.text, this.deps.platform);
+      this.log.debug(`snapshot: ${snapshot.count} elements${snapshot.truncated ? " (capped)" : ""}`);
+      return renderSnapshot(snapshot);
+    } catch (err) {
+      this.log.debug("snapshot build failed", err);
+      return null;
+    }
+  }
+
   /** Grab a screenshot as an Anthropic image block, or null on failure. */
   private async captureScreenshot(): Promise<ContentBlockParam | null> {
     const result = await this.deps.mcp.callTool("appium_screenshot", {});
@@ -215,37 +261,50 @@ export class MobileAgent {
   }
 
   /**
-   * Replace all but the most recent screenshots with a text placeholder.
-   * Screenshots dominate token usage; keeping only the latest couple preserves
-   * the visual context that matters while bounding the window.
+   * Bound the context window by keeping only the most recent screenshots and UI
+   * snapshots. Both dominate token usage; older ones are replaced with a short
+   * placeholder so the conversation stays coherent without growing unboundedly.
    */
-  private pruneScreenshots(): void {
-    const replacers: Array<() => void> = [];
+  private pruneObservations(): void {
+    const screenshots: Array<() => void> = [];
+    const snapshots: Array<() => void> = [];
+
+    const consider = (
+      arr: Array<Anthropic.ContentBlockParam>,
+      index: number,
+      block: Anthropic.ContentBlockParam,
+    ): void => {
+      if (block.type === "image") {
+        screenshots.push(() => {
+          arr[index] = { type: "text", text: "[earlier screenshot omitted]" };
+        });
+      } else if (block.type === "text" && block.text.startsWith(SNAPSHOT_MARKER)) {
+        snapshots.push(() => {
+          arr[index] = { type: "text", text: "[earlier UI snapshot omitted]" };
+        });
+      }
+    };
 
     for (const msg of this.messages) {
       if (!Array.isArray(msg.content)) continue;
       const content = msg.content as ContentBlockParam[];
       content.forEach((block, i) => {
-        if (block.type === "image") {
-          replacers.push(() => {
-            content[i] = { type: "text", text: "[earlier screenshot omitted]" };
-          });
-        } else if (block.type === "tool_result" && Array.isArray(block.content)) {
+        consider(content, i, block);
+        if (block.type === "tool_result" && Array.isArray(block.content)) {
           const inner = block.content as Array<Anthropic.ContentBlockParam>;
-          inner.forEach((sub, j) => {
-            if (sub.type === "image") {
-              replacers.push(() => {
-                inner[j] = { type: "text", text: "[earlier screenshot omitted]" };
-              });
-            }
-          });
+          inner.forEach((sub, j) => consider(inner, j, sub));
         }
       });
     }
 
-    const removeCount = Math.max(0, replacers.length - SCREENSHOTS_TO_KEEP);
-    for (let i = 0; i < removeCount; i++) replacers[i]?.();
+    prune(screenshots, SCREENSHOTS_TO_KEEP);
+    prune(snapshots, SNAPSHOTS_TO_KEEP);
   }
+}
+
+function prune(replacers: Array<() => void>, keep: number): void {
+  const removeCount = Math.max(0, replacers.length - keep);
+  for (let i = 0; i < removeCount; i++) replacers[i]?.();
 }
 
 function compact(obj: Record<string, unknown>): string {

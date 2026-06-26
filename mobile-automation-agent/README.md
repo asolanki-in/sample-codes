@@ -52,6 +52,15 @@ simulators, and real devices).
   auto-spawned locally (`appium-mcp --httpStream --port=8080`, endpoint `/sse`)
   or you can attach to a shared/remote server via `MCP_HTTP_URL`. Set
   `MCP_TRANSPORT=stdio` to fall back to stdio.
+- **Compact UI snapshot for element finding** — instead of dumping raw,
+  truncated page-source XML at the model, the agent parses it once and hands the
+  model a small JSON list of only the *actionable* elements, each with a
+  **precomputed, prioritised locator** (`by: {strategy, selector}`), a tap-point
+  (`c: [x,y]`), and compact `state` flags. This cuts tokens dramatically and
+  makes locating elements deterministic — the model uses the locator we already
+  derived (accessibility id > resource-id/name > text/predicate > xpath) rather
+  than guessing. Exposed as the `inspect_screen` tool and auto-attached at the
+  start of each step. See [`src/mcp/uiSnapshot.ts`](src/mcp/uiSnapshot.ts).
 - **Tools are discovered dynamically** from appium-mcp, so new server
   capabilities are available automatically.
 - **Vision** — a screenshot is attached at the start of every step; older
@@ -159,6 +168,36 @@ steps:
 **Plain text** (`.txt`): one natural-language step per line; `#` lines and blank
 lines are ignored.
 
+## Element finding
+
+How the agent locates things on screen, in order of preference:
+
+1. **Compact UI snapshot** (`inspect_screen`, also auto-attached each step).
+   The raw page-source XML is parsed into JSON containing only actionable
+   elements. Each entry looks like:
+
+   ```json
+   {"ref":3,"role":"Button","text":"Continue","acc":"Continue",
+    "state":"clickable","c":[540,650],
+    "by":{"strategy":"accessibility id","selector":"Continue"}}
+   ```
+
+   The `by` locator is computed with the recommended priority
+   (**accessibility id → resource-id/name → text/predicate → xpath**), so the
+   model just reuses it via `appium_find_element` instead of inventing a
+   selector. `state` exposes flags (e.g. `checked`) so toggles are handled by
+   reading state, not guessing. `c` gives a center point for coordinate taps
+   when no stable locator exists. Pure layout containers and invisible nodes are
+   dropped, and the list is capped — keeping the payload small (often a fraction
+   of the raw XML's tokens).
+
+2. **Screenshot (vision)** — attached for visual grounding/disambiguation.
+
+3. **Raw `appium_get_page_source`** — available as a fallback for the rare
+   attributes the snapshot omits (e.g. inspecting picker-wheel internals).
+
+Both Android (UiAutomator2) and iOS (XCUITest) trees are supported.
+
 ## Project layout
 
 ```
@@ -167,7 +206,8 @@ src/
   config.ts             env config, zod-validated
   logger.ts             dependency-free structured logger
   types.ts              shared domain types
-  mcp/appiumClient.ts   appium-mcp stdio client wrapper + result normalisation
+  mcp/appiumClient.ts   appium-mcp transport client (httpStream/stdio) + results
+  mcp/uiSnapshot.ts     page-source XML -> compact JSON with precomputed locators
   llm/toolAdapter.ts    MCP tools <-> Anthropic tool-use; result conversion
   agent/
     agent.ts            the observe/plan/act/verify/finish loop

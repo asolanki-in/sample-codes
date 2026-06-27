@@ -209,6 +209,23 @@ How the agent locates things on screen, in order of preference:
 
 Both Android (UiAutomator2) and iOS (XCUITest) trees are supported.
 
+**Unlabeled fields & relative selectors.** A common hard case is an editable
+field with no text/id of its own and a static label above it (e.g. a
+"Date of Birth" label over an empty `EditText`). Element geometry is kept
+internally (bounding boxes, stripped from the model payload) so:
+
+- `input_text{ into: { text: "Date of Birth" }, text: "01/01/1990" }` automatically
+  resolves to the editable field **directly below** that label — even with
+  several stacked unlabeled fields.
+- Relative anchors `below` / `above` / `leftOf` / `rightOf` (Maestro-style) are
+  available on `tap` and `input_text` to disambiguate, e.g.
+  `input_text{ into: { below: { text: "Last Name" } }, text: "Smith" }`.
+
+**Dates from a plain instruction.** The user only says *"Enter date of birth as
+01 01 1990"*; the agent parses it (day/month/year, 4-digit group = year) and
+performs the multi-step picker interaction — typing into a date field, or
+driving an Android calendar/spinner or iOS wheel — per the date-picker playbook.
+
 ## Project layout
 
 ```

@@ -39,11 +39,26 @@ export const inspectScreenTool: AnthropicTool = {
   },
 };
 
+const anchorProps = {
+  type: "object",
+  description:
+    "Anchor element to position relative to (e.g. a label). Match it by text/id/accessibilityId.",
+  properties: {
+    text: { type: "string" },
+    id: { type: "string" },
+    accessibilityId: { type: "string" },
+  },
+} as const;
+
 const elementQueryProps = {
   text: { type: "string", description: "Match by visible text / accessibility id / value (case-insensitive, substring OK)." },
   id: { type: "string", description: "Match by resource-id (Android) substring." },
   accessibilityId: { type: "string", description: "Match by exact accessibility id / content-desc / name." },
   index: { type: "number", description: "0-based index to pick when several elements match." },
+  below: { ...anchorProps, description: "Restrict to elements positioned below this anchor (e.g. the input under a label)." },
+  above: { ...anchorProps, description: "Restrict to elements positioned above this anchor." },
+  leftOf: { ...anchorProps, description: "Restrict to elements positioned left of this anchor." },
+  rightOf: { ...anchorProps, description: "Restrict to elements positioned right of this anchor." },
 } as const;
 
 /**

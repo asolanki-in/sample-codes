@@ -46,6 +46,12 @@ export interface UiElement {
   state?: string;
   /** center point [x, y] for coordinate taps as a fallback. */
   c?: [number, number];
+  /**
+   * bounding box [x1, y1, x2, y2]. Kept for internal spatial reasoning
+   * (relative selectors, label→input association) and stripped from the text
+   * we send to the model to save tokens.
+   */
+  b?: [number, number, number, number];
   /** recommended locator for appium_find_element. */
   by?: Locator;
 }
@@ -128,7 +134,11 @@ export function renderSnapshot(snapshot: UiSnapshot): string {
     `UI_SNAPSHOT ${snapshot.platform}` +
     (snapshot.size ? ` size=${snapshot.size[0]}x${snapshot.size[1]}` : "") +
     ` elements=${snapshot.count}${snapshot.truncated ? "(capped)" : ""}`;
-  const body = JSON.stringify(snapshot.elements);
+  // `b` (bounding box) is for internal spatial reasoning only — strip it to
+  // keep the model payload small; `c` (center) stays for coordinate taps.
+  const body = JSON.stringify(snapshot.elements, (key, value) =>
+    key === "b" ? undefined : value,
+  );
   return `${header}\n${body}`;
 }
 
@@ -167,8 +177,11 @@ function toAndroidElement(attrs: Attrs): UiElement | null {
   if (desc) el.acc = desc;
   if (resourceId) el.id = resourceId;
 
-  const center = centerFromBounds(attrs.bounds);
-  if (center) el.c = center;
+  const box = boxFromBounds(attrs.bounds);
+  if (box) {
+    el.b = box;
+    el.c = [Math.round((box[0] + box[2]) / 2), Math.round((box[1] + box[3]) / 2)];
+  }
 
   const state = [
     clickable ? "clickable" : "",
@@ -233,8 +246,11 @@ function toIosElement(attrs: Attrs, tag: string): UiElement | null {
   if (name) el.acc = name;
   if (value) el.val = value;
 
-  const center = centerFromBox(attrs);
-  if (center) el.c = center;
+  const box = boxFromXywh(attrs);
+  if (box) {
+    el.b = box;
+    el.c = [Math.round((box[0] + box[2]) / 2), Math.round((box[1] + box[3]) / 2)];
+  }
 
   const state = [
     interactive ? "clickable" : "",
@@ -309,26 +325,22 @@ function shortRole(cls: string): string {
   return r || "View";
 }
 
-/** Android bounds "[x1,y1][x2,y2]" -> center [x, y]. */
-function centerFromBounds(bounds: string | undefined): [number, number] | undefined {
+/** Android bounds "[x1,y1][x2,y2]" -> box [x1, y1, x2, y2]. */
+function boxFromBounds(bounds: string | undefined): [number, number, number, number] | undefined {
   if (!bounds) return undefined;
   const m = bounds.match(/\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]/);
   if (!m) return undefined;
-  const x1 = Number(m[1]);
-  const y1 = Number(m[2]);
-  const x2 = Number(m[3]);
-  const y2 = Number(m[4]);
-  return [Math.round((x1 + x2) / 2), Math.round((y1 + y2) / 2)];
+  return [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])];
 }
 
-/** iOS x/y/width/height -> center [x, y]. */
-function centerFromBox(attrs: Attrs): [number, number] | undefined {
+/** iOS x/y/width/height -> box [x1, y1, x2, y2]. */
+function boxFromXywh(attrs: Attrs): [number, number, number, number] | undefined {
   const x = Number(attrs.x);
   const y = Number(attrs.y);
   const w = Number(attrs.width);
   const h = Number(attrs.height);
   if ([x, y, w, h].some((n) => !Number.isFinite(n))) return undefined;
-  return [Math.round(x + w / 2), Math.round(y + h / 2)];
+  return [x, y, x + w, y + h];
 }
 
 function readSize(attrs: Attrs, platform: Platform): [number, number] | undefined {
@@ -338,8 +350,6 @@ function readSize(attrs: Attrs, platform: Platform): [number, number] | undefine
     if (Number.isFinite(w) && Number.isFinite(h) && w > 0 && h > 0) return [w, h];
     return undefined;
   }
-  const c = centerFromBounds(attrs.bounds);
-  if (!c) return undefined;
   const m = attrs.bounds?.match(/\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]/);
   if (!m) return undefined;
   return [Number(m[3]), Number(m[4])];

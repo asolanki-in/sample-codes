@@ -34,12 +34,24 @@ export interface DeviceOptions {
   tapMaxRetries?: number;
 }
 
+/** A simple anchor used by relative selectors. */
+export interface AnchorQuery {
+  text?: string;
+  id?: string;
+  accessibilityId?: string;
+}
+
 export interface ElementQuery {
   text?: string;
   id?: string;
   accessibilityId?: string;
   /** disambiguate when several elements match (0-based). */
   index?: number;
+  /** spatial constraints relative to another element (Maestro-style). */
+  below?: AnchorQuery;
+  above?: AnchorQuery;
+  leftOf?: AnchorQuery;
+  rightOf?: AnchorQuery;
 }
 
 export interface ActionResult {
@@ -113,13 +125,70 @@ export class DeviceController {
    * forgiving text/accessibility matching.
    */
   match(snapshot: UiSnapshot, query: ElementQuery): UiElement[] {
+    // Resolve any relative anchors first, then keep only candidates that satisfy
+    // the spatial relation (e.g. "the field below the 'Email' label").
+    const anchors = this.resolveAnchors(snapshot, query);
+    let pool = snapshot.elements;
+    for (const { el: anchor, relation } of anchors) {
+      pool = pool.filter((cand) => cand !== anchor && satisfies(cand, anchor, relation));
+    }
+
+    const hasPrimary = Boolean(query.text || query.id || query.accessibilityId);
+    if (!hasPrimary) {
+      // Relative-only query: order by proximity to the (first) anchor.
+      const anchor = anchors[0]?.el;
+      if (!anchor) return [];
+      return [...pool].sort((a, b) => distance(a, anchor) - distance(b, anchor));
+    }
+
     const scored: Array<{ el: UiElement; score: number }> = [];
-    for (const el of snapshot.elements) {
+    for (const el of pool) {
       const score = scoreElement(el, query);
       if (score > 0) scored.push({ el, score });
     }
     scored.sort((a, b) => b.score - a.score || a.el.ref - b.el.ref);
     return scored.map((s) => s.el);
+  }
+
+  /** Resolve each present relative anchor to a concrete element. */
+  private resolveAnchors(
+    snapshot: UiSnapshot,
+    query: ElementQuery,
+  ): Array<{ el: UiElement; relation: Relation }> {
+    const out: Array<{ el: UiElement; relation: Relation }> = [];
+    const dirs: Array<[Relation, AnchorQuery | undefined]> = [
+      ["below", query.below],
+      ["above", query.above],
+      ["leftOf", query.leftOf],
+      ["rightOf", query.rightOf],
+    ];
+    for (const [relation, anchorQuery] of dirs) {
+      if (!anchorQuery) continue;
+      const el = this.match(snapshot, { ...anchorQuery })[0];
+      if (el) out.push({ el, relation });
+    }
+    return out;
+  }
+
+  /**
+   * Find the editable field associated with a (possibly non-editable) label.
+   * Handles the common pattern of a static label sitting directly above an
+   * unlabeled EditText / TextField. Returns the label itself if it is editable.
+   */
+  findInputFor(snapshot: UiSnapshot, label: UiElement): UiElement | undefined {
+    if (isEditable(label)) return label;
+    const fields = snapshot.elements.filter(isEditable);
+    if (fields.length === 0) return undefined;
+
+    // Prefer a field directly below the label and horizontally overlapping it,
+    // with the smallest vertical gap (the field immediately under this label).
+    const below = fields
+      .filter((f) => isBelow(f, label) && horizontallyOverlaps(f, label))
+      .sort((a, b) => topGap(a, label) - topGap(b, label));
+    if (below.length > 0) return below[0];
+
+    // Otherwise the nearest editable field by center distance.
+    return [...fields].sort((a, b) => distance(a, label) - distance(b, label))[0];
   }
 
   /** Implicit-wait for a matching element to appear; returns it + the snapshot. */
@@ -206,14 +275,19 @@ export class DeviceController {
       if (!found.element) {
         return { ok: false, message: `No input matched ${describe(args.into)}.`, snapshot: found.text };
       }
-      const uuid = await this.resolveUuid(found.element);
+      // The match may be a static label above an unlabeled field — resolve to
+      // the actual editable element.
+      const field = this.findInputFor(found.snapshot, found.element) ?? found.element;
+      const viaLabel = field !== found.element ? " (field below the label)" : "";
+
+      const uuid = await this.resolveUuid(field);
       if (uuid) {
         const res = await this.mcp.callTool("appium_set_value", { elementUUID: uuid, text: args.text });
         const after = await this.waitForStableHierarchy();
-        return this.result(!res.isError, `Entered text into ${describe(args.into)}.`, after, true);
+        return this.result(!res.isError, `Entered text into ${describe(args.into)}${viaLabel}.`, after, true);
       }
-      // No locator: focus by tapping its center, then type into focus.
-      if (found.element.c) await this.tapAt(found.element.c[0], found.element.c[1]);
+      // No locator (unlabeled field): focus by tapping its center, then type.
+      if (field.c) await this.tapAt(field.c[0], field.c[1]);
     }
 
     const res = await this.mcp.callTool("appium_set_value", { text: args.text, w3cActions: true });
@@ -348,6 +422,80 @@ export class DeviceController {
 // ---------------------------------------------------------------------------
 // pure helpers
 // ---------------------------------------------------------------------------
+
+type Relation = "below" | "above" | "leftOf" | "rightOf";
+
+function isEditable(el: UiElement): boolean {
+  // The snapshot sets the `editable` flag per-platform (Android EditText; iOS
+  // TextField/SecureTextField/SearchField/TextView), which is authoritative.
+  // The role check is only a fallback and deliberately excludes Android's
+  // static TextView.
+  if (el.state?.includes("editable")) return true;
+  return /EditText|TextField|SecureTextField|SearchField/i.test(el.role);
+}
+
+function centerOf(el: UiElement): [number, number] | undefined {
+  if (el.c) return el.c;
+  if (el.b) return [(el.b[0] + el.b[2]) / 2, (el.b[1] + el.b[3]) / 2];
+  return undefined;
+}
+
+function distance(a: UiElement, b: UiElement): number {
+  const ca = centerOf(a);
+  const cb = centerOf(b);
+  if (!ca || !cb) return Number.POSITIVE_INFINITY;
+  return Math.hypot(ca[0] - cb[0], ca[1] - cb[1]);
+}
+
+/** Candidate is below the anchor (its center sits beneath the anchor's center). */
+function isBelow(cand: UiElement, anchor: UiElement): boolean {
+  const c = centerOf(cand);
+  const a = centerOf(anchor);
+  return !!c && !!a && c[1] > a[1];
+}
+
+/** Vertical gap from the anchor's bottom to the candidate's top. */
+function topGap(cand: UiElement, anchor: UiElement): number {
+  const top = cand.b ? cand.b[1] : centerOf(cand)?.[1] ?? 0;
+  const bottom = anchor.b ? anchor.b[3] : centerOf(anchor)?.[1] ?? 0;
+  return Math.abs(top - bottom);
+}
+
+/** Candidate's horizontal span overlaps the anchor's (same column). */
+function horizontallyOverlaps(cand: UiElement, anchor: UiElement): boolean {
+  if (!cand.b || !anchor.b) {
+    const c = centerOf(cand);
+    const a = centerOf(anchor);
+    return !!c && !!a && Math.abs(c[0] - a[0]) < 200;
+  }
+  return cand.b[0] < anchor.b[2] && cand.b[2] > anchor.b[0];
+}
+
+/** Does a candidate satisfy a spatial relation to the anchor? */
+function satisfies(cand: UiElement, anchor: UiElement, relation: Relation): boolean {
+  const c = centerOf(cand);
+  const a = centerOf(anchor);
+  if (!c || !a) return false;
+  switch (relation) {
+    case "below":
+      return c[1] > a[1] && horizontallyOverlaps(cand, anchor);
+    case "above":
+      return c[1] < a[1] && horizontallyOverlaps(cand, anchor);
+    case "rightOf":
+      return c[0] > a[0] && verticallyOverlaps(cand, anchor);
+    case "leftOf":
+      return c[0] < a[0] && verticallyOverlaps(cand, anchor);
+  }
+}
+
+function verticallyOverlaps(cand: UiElement, anchor: UiElement): boolean {
+  if (!cand.b || !anchor.b) {
+    const c = centerOf(cand);
+    const a = centerOf(anchor);
+    return !!c && !!a && Math.abs(c[1] - a[1]) < 120;
+  }
+  return cand.b[1] < anchor.b[3] && cand.b[3] > anchor.b[1];
+}
 
 function scoreElement(el: UiElement, query: ElementQuery): number {
   let best = 0;

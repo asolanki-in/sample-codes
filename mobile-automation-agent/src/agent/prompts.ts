@@ -73,15 +73,24 @@ const PLAYBOOKS = `# Interaction playbooks
 - Call \`input_text{ text: "hello", into: { text: "Username" } }\` (or \`into\` by id/accessibilityId). The field is focused and its value replaced.
 - If the field is already focused, just \`input_text{ text: "hello" }\`.
 
+### Unlabeled fields with a separate label (IMPORTANT)
+Many forms have an editable field with NO text/id of its own, and a static label sitting above it (e.g. a "Date of Birth" TextView above an empty EditText). Do NOT try to type into the label.
+- Just pass the visible label as \`into.text\`: \`input_text{ text: "hello", into: { text: "Date of Birth" } }\`. The tool automatically targets the editable field directly below that label.
+- When there are SEVERAL unlabeled fields (e.g. First/Last name stacked), the label association still picks the field under the right label. If it ever picks the wrong one, use a relative anchor explicitly: \`input_text{ text: "Smith", into: { below: { text: "Last Name" } } }\`.
+- Relative anchors (\`below\`, \`above\`, \`leftOf\`, \`rightOf\`) work on \`tap\` too — e.g. tap an icon \`rightOf\` a row's title.
+- In the snapshot, an editable field is the one whose \`state\` includes \`editable\`; a label is a TextView/StaticText without it.
+
 ## GO BACK ("Go back")
 - Call \`back\`. (Raw fallback: \`appium_gesture\` action "back"; on iOS with no system back, \`tap\` the on-screen back/chevron.)
 
 ## TOGGLE a switch / checkbox ("Toggle switch of activity")
 - Call \`toggle{ text: "Activity" }\` to flip, or \`toggle{ text: "Activity", to: "on" }\` / \`to: "off"\` to ensure a state. It reads the current state and only taps when needed, then verifies.
 
-## DATE PICKER ("Enter date of birth", "Pick a date")
-First inspect the screen (snapshot, falling back to \`appium_get_page_source\` for wheel internals) and identify the picker type, then apply the matching technique:
-- If a plain editable text/date field: tap it and \`appium_set_value\` with the date in the format the field expects (read its hint/placeholder).
+## DATE PICKER ("Enter date of birth as 01 01 1990")
+The user gives just a date (e.g. "01 01 1990", "01/01/1990", "1 Jan 1990"); YOU perform the multiple actions needed.
+First PARSE the date into day / month / year. Default order is DAY MONTH YEAR (so "01 01 1990" = day 01, month 01 (January), year 1990) unless a field's hint/placeholder clearly says otherwise (e.g. MM/DD/YYYY). The 4-digit group is always the year.
+Then inspect the screen (snapshot; use \`appium_get_page_source\` for wheel internals) and identify the picker type:
+- Plain editable date field (state \`editable\`): this is the easy path — \`input_text{ text: "<formatted to the field's hint, e.g. 01/01/1990>", into: { text: "Date of Birth" } }\`. The label→field association finds the unlabeled input. Then verify the field shows the date; if tapping it instead popped a calendar/spinner, handle it below.
 - ANDROID calendar dialog (CalendarView / DatePicker): the header shows the current month/year. Tap the year if you need a far year, then tap the day cell whose content-desc matches the target date (e.g. content-desc "15 June 2026"). Use the next/previous month arrows (content-desc "Next month"/"Previous month") to navigate months.
 - ANDROID spinner DatePicker (NumberPickers): each wheel (month/day/year) is a NumberPicker. Adjust a wheel by tapping its increment/decrement buttons, or use \`appium_gesture\` swipe up/down on the wheel, until the selected value matches. Verify via page source between adjustments.
 - iOS UIDatePicker (wheels of type XCUIElementTypePickerWheel): set each wheel with \`appium_set_value\` passing the target value as text (e.g. set the month wheel to "June", day wheel to "15", year wheel to "2026"). If set_value is unsupported, swipe the wheel.

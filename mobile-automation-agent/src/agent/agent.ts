@@ -2,25 +2,32 @@
  * The agent loop.
  *
  * For each natural-language step the agent runs a bounded OBSERVE -> PLAN ->
- * ACT -> VERIFY -> FINISH cycle, calling appium-mcp tools through Claude's
- * tool-use API until it calls `report_step_result`.
+ * ACT -> VERIFY -> FINISH cycle, calling tools through a provider-neutral LLM
+ * (Anthropic or Ollama Cloud) until it calls `report_step_result`.
  *
  * Conversation history is shared across steps so the agent remembers what it
- * already did, but screenshots are pruned to the most recent few to keep the
- * context window (and cost/latency) bounded.
+ * already did, but screenshots and UI snapshots are pruned to the most recent
+ * few to keep the context window (and cost/latency) bounded.
  */
 
-import type Anthropic from "@anthropic-ai/sdk";
 import type { Logger } from "../logger.js";
 import type { AppiumMcpClient } from "../mcp/appiumClient.js";
+import { SNAPSHOT_MARKER } from "../mcp/uiSnapshot.js";
 import type { ToolCallRecord } from "../types.js";
 import {
-  type AnthropicTool,
   INSPECT_SCREEN_TOOL,
   RELIABLE_ACTION_NAMES,
-  toToolResultContent,
+  toToolResultParts,
 } from "../llm/toolAdapter.js";
-import { SNAPSHOT_MARKER } from "../mcp/uiSnapshot.js";
+import type {
+  ChatMessage,
+  ImagePart,
+  LlmProvider,
+  Part,
+  ToolCall,
+  ToolDef,
+  ToolMessage,
+} from "../llm/types.js";
 import type { DeviceController, ElementQuery } from "./device.js";
 import { STEP_COMPLETE_TOOL, buildStepInstruction } from "./prompts.js";
 
@@ -29,17 +36,12 @@ const SCREENSHOTS_TO_KEEP = 2;
 /** How many recent UI snapshots to retain in history. */
 const SNAPSHOTS_TO_KEEP = 2;
 
-type MessageParam = Anthropic.MessageParam;
-type ContentBlockParam = Anthropic.ContentBlockParam;
-
 export interface AgentDeps {
-  anthropic: Anthropic;
+  provider: LlmProvider;
   mcp: AppiumMcpClient;
   device: DeviceController;
-  tools: AnthropicTool[];
+  tools: ToolDef[];
   systemPrompt: string;
-  model: string;
-  maxTokens: number;
   maxStepIterations: number;
   visionEnabled: boolean;
   logger: Logger;
@@ -54,62 +56,50 @@ export interface RunStepOutcome {
 }
 
 export class MobileAgent {
-  private readonly messages: MessageParam[] = [];
+  private readonly messages: ChatMessage[] = [];
   private readonly log: Logger;
+  private readonly useVision: boolean;
 
   constructor(private readonly deps: AgentDeps) {
     this.log = deps.logger.child("agent");
+    this.useVision = deps.visionEnabled && deps.provider.supportsImages;
   }
 
   /** Drive the model until the given step is finished. */
   async runStep(stepText: string, index: number, total: number): Promise<RunStepOutcome> {
     const toolCalls: ToolCallRecord[] = [];
 
-    // OBSERVE: seed the step with a fresh compact UI snapshot (for precise
-    // selectors) and, when enabled, a screenshot (for visual grounding).
-    const stepContent: ContentBlockParam[] = [
-      { type: "text", text: buildStepInstruction(stepText, index, total) },
-    ];
+    // OBSERVE: seed the step with a fresh settled snapshot (+ screenshot when
+    // the provider supports vision).
+    const parts: Part[] = [{ type: "text", text: buildStepInstruction(stepText, index, total) }];
     const snapshot = await this.captureSnapshot();
-    if (snapshot) stepContent.push({ type: "text", text: snapshot });
-    if (this.deps.visionEnabled) {
+    if (snapshot) parts.push({ type: "text", text: snapshot });
+    if (this.useVision) {
       const shot = await this.captureScreenshot();
-      if (shot) stepContent.push(shot);
+      if (shot) parts.push(shot);
     }
-    this.messages.push({ role: "user", content: stepContent });
+    this.messages.push({ role: "user", parts });
 
     let nudged = false;
 
     for (let iteration = 1; iteration <= this.deps.maxStepIterations; iteration++) {
       this.pruneObservations();
 
-      const response = await this.deps.anthropic.messages.create({
-        model: this.deps.model,
-        max_tokens: this.deps.maxTokens,
+      const result = await this.deps.provider.chat({
         system: this.deps.systemPrompt,
         tools: this.deps.tools,
         messages: this.messages,
       });
 
-      this.messages.push({ role: "assistant", content: response.content });
+      this.messages.push({ role: "assistant", text: result.text, toolCalls: result.toolCalls });
+      if (result.text) this.log.debug(`think: ${result.text}`);
 
-      const toolUses = response.content.filter(
-        (b): b is Anthropic.ToolUseBlock => b.type === "tool_use",
-      );
-      const assistantText = response.content
-        .filter((b): b is Anthropic.TextBlock => b.type === "text")
-        .map((b) => b.text)
-        .join(" ")
-        .trim();
-      if (assistantText) this.log.debug(`think: ${assistantText}`);
-
-      if (toolUses.length === 0) {
-        // The model replied with text but took no action.
+      if (result.toolCalls.length === 0) {
         if (!nudged) {
           nudged = true;
           this.messages.push({
             role: "user",
-            content: [
+            parts: [
               {
                 type: "text",
                 text: `Continue executing the step using tools. When it is finished, call ${STEP_COMPLETE_TOOL}.`,
@@ -121,23 +111,19 @@ export class MobileAgent {
         return {
           status: "failure",
           summary: "Agent stopped without completing the step.",
-          details: assistantText || undefined,
+          details: result.text,
           iterations: iteration,
           toolCalls,
         };
       }
       nudged = false;
 
-      const toolResults: ContentBlockParam[] = [];
+      const toolMessages: ToolMessage[] = [];
       let finished: RunStepOutcome | null = null;
 
-      for (const use of toolUses) {
-        if (use.name === STEP_COMPLETE_TOOL) {
-          const input = (use.input ?? {}) as {
-            status?: string;
-            summary?: string;
-            details?: string;
-          };
+      for (const call of result.toolCalls) {
+        if (call.name === STEP_COMPLETE_TOOL) {
+          const input = call.input as { status?: string; summary?: string; details?: string };
           finished = {
             status: input.status === "failure" ? "failure" : "success",
             summary: input.summary ?? "(no summary)",
@@ -145,49 +131,34 @@ export class MobileAgent {
             iterations: iteration,
             toolCalls,
           };
-          toolResults.push({
-            type: "tool_result",
-            tool_use_id: use.id,
-            content: [{ type: "text", text: "Acknowledged." }],
-          });
+          toolMessages.push(toolMsg(call, [{ type: "text", text: "Acknowledged." }]));
           continue;
         }
 
-        if (use.name === INSPECT_SCREEN_TOOL) {
+        if (call.name === INSPECT_SCREEN_TOOL) {
           const started = Date.now();
-          const snapshot = (await this.captureSnapshot()) ?? "UI_SNAPSHOT (unavailable)";
-          toolCalls.push({
-            tool: INSPECT_SCREEN_TOOL,
-            input: {},
-            ok: true,
-            durationMs: Date.now() - started,
-          });
-          toolResults.push({
-            type: "tool_result",
-            tool_use_id: use.id,
-            content: [{ type: "text", text: snapshot }],
-          });
+          const snap = (await this.captureSnapshot()) ?? "UI_SNAPSHOT (unavailable)";
+          toolCalls.push({ tool: INSPECT_SCREEN_TOOL, input: {}, ok: true, durationMs: Date.now() - started });
+          toolMessages.push(toolMsg(call, [{ type: "text", text: snap }]));
           continue;
         }
 
-        if (RELIABLE_ACTION_NAMES.has(use.name)) {
-          const record = await this.executeReliableAction(use);
-          toolCalls.push(record.record);
-          toolResults.push(record.block);
+        if (RELIABLE_ACTION_NAMES.has(call.name)) {
+          const { record, parts: rparts, isError } = await this.executeReliableAction(call);
+          toolCalls.push(record);
+          toolMessages.push(toolMsg(call, rparts, isError));
           continue;
         }
 
-        const record = await this.executeTool(use);
-        toolCalls.push(record.record);
-        toolResults.push(record.block);
+        const { record, parts: rparts, isError } = await this.executeTool(call);
+        toolCalls.push(record);
+        toolMessages.push(toolMsg(call, rparts, isError));
       }
 
-      this.messages.push({ role: "user", content: toolResults });
+      this.messages.push(...toolMessages);
 
       if (finished) {
-        this.log.info(
-          `step ${index}/${total} ${finished.status.toUpperCase()}: ${finished.summary}`,
-        );
+        this.log.info(`step ${index}/${total} ${finished.status.toUpperCase()}: ${finished.summary}`);
         return finished;
       }
     }
@@ -200,70 +171,47 @@ export class MobileAgent {
     };
   }
 
-  /** Execute one appium-mcp tool call and produce a tool_result block + record. */
+  /** Execute one appium-mcp tool call. */
   private async executeTool(
-    use: Anthropic.ToolUseBlock,
-  ): Promise<{ record: ToolCallRecord; block: ContentBlockParam }> {
-    const args = (use.input ?? {}) as Record<string, unknown>;
-    this.log.info(`tool ${use.name} ${compact(args)}`);
-
+    call: ToolCall,
+  ): Promise<{ record: ToolCallRecord; parts: Part[]; isError: boolean }> {
+    this.log.info(`tool ${call.name} ${compact(call.input)}`);
     const started = Date.now();
-    const result = await this.deps.mcp.callTool(use.name, args);
+    const result = await this.deps.mcp.callTool(call.name, call.input);
     const durationMs = Date.now() - started;
 
-    if (result.isError) {
-      this.log.warn(`tool ${use.name} error: ${result.text.slice(0, 200)}`);
-    }
+    if (result.isError) this.log.warn(`tool ${call.name} error: ${result.text.slice(0, 200)}`);
 
     const record: ToolCallRecord = {
-      tool: use.name,
-      input: args,
+      tool: call.name,
+      input: call.input,
       ok: !result.isError,
       durationMs,
       ...(result.isError ? { error: result.text.slice(0, 500) } : {}),
     };
-
-    const block: ContentBlockParam = {
-      type: "tool_result",
-      tool_use_id: use.id,
-      is_error: result.isError,
-      content: toToolResultContent(result),
-    };
-
-    return { record, block };
+    return { record, parts: toToolResultParts(result), isError: result.isError };
   }
 
   /** Execute a high-level reliable action through the DeviceController. */
   private async executeReliableAction(
-    use: Anthropic.ToolUseBlock,
-  ): Promise<{ record: ToolCallRecord; block: ContentBlockParam }> {
-    const args = (use.input ?? {}) as Record<string, unknown>;
-    this.log.info(`action ${use.name} ${compact(args)}`);
-
+    call: ToolCall,
+  ): Promise<{ record: ToolCallRecord; parts: Part[]; isError: boolean }> {
+    this.log.info(`action ${call.name} ${compact(call.input)}`);
     const started = Date.now();
-    const result = await this.runAction(use.name, args);
+    const result = await this.runAction(call.name, call.input);
     const durationMs = Date.now() - started;
 
-    if (!result.ok) this.log.warn(`action ${use.name}: ${result.message}`);
+    if (!result.ok) this.log.warn(`action ${call.name}: ${result.message}`);
 
     const record: ToolCallRecord = {
-      tool: use.name,
-      input: args,
+      tool: call.name,
+      input: call.input,
       ok: result.ok,
       durationMs,
       ...(result.ok ? {} : { error: result.message }),
     };
-
-    // Feed the outcome plus a fresh settled snapshot back to the model.
     const text = `${result.ok ? "OK" : "FAILED"}: ${result.message}\n${result.snapshot}`;
-    const block: ContentBlockParam = {
-      type: "tool_result",
-      tool_use_id: use.id,
-      is_error: !result.ok,
-      content: [{ type: "text", text }],
-    };
-
-    return { record, block };
+    return { record, parts: [{ type: "text", text }], isError: !result.ok };
   }
 
   /** Dispatch a reliable-action tool name to the DeviceController. */
@@ -294,18 +242,11 @@ export class MobileAgent {
       case "back":
         return device.back();
       default:
-        return Promise.resolve({
-          ok: false,
-          message: `Unknown action ${name}`,
-          snapshot: "",
-        });
+        return Promise.resolve({ ok: false, message: `Unknown action ${name}`, snapshot: "" });
     }
   }
 
-  /**
-   * Settle the UI and return the compact snapshot text, or null if unavailable
-   * (e.g. no active session yet).
-   */
+  /** Settle the UI and return the compact snapshot text, or null if unavailable. */
   private async captureSnapshot(): Promise<string | null> {
     try {
       const { snapshot, text } = await this.deps.device.snapshot();
@@ -318,8 +259,8 @@ export class MobileAgent {
     }
   }
 
-  /** Grab a screenshot as an Anthropic image block, or null on failure. */
-  private async captureScreenshot(): Promise<ContentBlockParam | null> {
+  /** Grab a screenshot as an image part, or null on failure. */
+  private async captureScreenshot(): Promise<ImagePart | null> {
     const result = await this.deps.mcp.callTool("appium_screenshot", {});
     if (result.isError) {
       this.log.debug(`screenshot failed: ${result.text.slice(0, 120)}`);
@@ -327,52 +268,42 @@ export class MobileAgent {
     }
     const image = result.blocks.find((b) => b.type === "image");
     if (!image || image.type !== "image") return null;
-    return {
-      type: "image",
-      source: { type: "base64", media_type: "image/png", data: image.data },
-    };
+    return { type: "image", data: image.data, mime: "image/png" };
   }
 
   /**
    * Bound the context window by keeping only the most recent screenshots and UI
-   * snapshots. Both dominate token usage; older ones are replaced with a short
-   * placeholder so the conversation stays coherent without growing unboundedly.
+   * snapshots; older ones become short placeholders.
    */
   private pruneObservations(): void {
     const screenshots: Array<() => void> = [];
     const snapshots: Array<() => void> = [];
 
-    const consider = (
-      arr: Array<Anthropic.ContentBlockParam>,
-      index: number,
-      block: Anthropic.ContentBlockParam,
-    ): void => {
-      if (block.type === "image") {
-        screenshots.push(() => {
-          arr[index] = { type: "text", text: "[earlier screenshot omitted]" };
-        });
-      } else if (block.type === "text" && block.text.startsWith(SNAPSHOT_MARKER)) {
-        snapshots.push(() => {
-          arr[index] = { type: "text", text: "[earlier UI snapshot omitted]" };
-        });
-      }
-    };
-
-    for (const msg of this.messages) {
-      if (!Array.isArray(msg.content)) continue;
-      const content = msg.content as ContentBlockParam[];
-      content.forEach((block, i) => {
-        consider(content, i, block);
-        if (block.type === "tool_result" && Array.isArray(block.content)) {
-          const inner = block.content as Array<Anthropic.ContentBlockParam>;
-          inner.forEach((sub, j) => consider(inner, j, sub));
+    const scan = (parts: Part[]): void => {
+      parts.forEach((part, i) => {
+        if (part.type === "image") {
+          screenshots.push(() => {
+            parts[i] = { type: "text", text: "[earlier screenshot omitted]" };
+          });
+        } else if (part.type === "text" && part.text.startsWith(SNAPSHOT_MARKER)) {
+          snapshots.push(() => {
+            parts[i] = { type: "text", text: "[earlier UI snapshot omitted]" };
+          });
         }
       });
+    };
+
+    for (const m of this.messages) {
+      if (m.role === "user" || m.role === "tool") scan(m.parts);
     }
 
     prune(screenshots, SCREENSHOTS_TO_KEEP);
     prune(snapshots, SNAPSHOTS_TO_KEEP);
   }
+}
+
+function toolMsg(call: ToolCall, parts: Part[], isError = false): ToolMessage {
+  return { role: "tool", toolCallId: call.id, name: call.name, parts, isError };
 }
 
 function prune(replacers: Array<() => void>, keep: number): void {

@@ -23,6 +23,7 @@ interface RunOptions {
   appPackage?: string;
   appActivity?: string;
   bundleId?: string;
+  provider?: "anthropic" | "ollama";
   model?: string;
   maxIterations?: string;
   report?: string;
@@ -37,7 +38,7 @@ const program = new Command();
 program
   .name("mobile-agent")
   .description(
-    "Run end-to-end mobile UI flows from natural-language steps using Claude + appium-mcp.",
+    "Run end-to-end mobile UI flows from natural-language steps using an LLM (Ollama Cloud or Claude) + appium-mcp.",
   )
   .version("1.0.0");
 
@@ -51,7 +52,8 @@ program
   .option("--app-package <pkg>", "Android app package")
   .option("--app-activity <activity>", "Android launch activity")
   .option("--bundle-id <id>", "iOS bundle id")
-  .option("-m, --model <model>", "Anthropic model override")
+  .addOption(new Option("--provider <provider>", "LLM provider").choices(["anthropic", "ollama"]))
+  .option("-m, --model <model>", "model override for the active provider")
   .option("--max-iterations <n>", "max model<->device round trips per step")
   .option("-r, --report <path>", "write a JSON report to this path")
   .option("--no-vision", "disable sending screenshots to the model")
@@ -126,7 +128,11 @@ function applyOverrides(config: AppConfiguration, options: RunOptions): void {
   if (options.appPackage) config.device.appPackage = options.appPackage;
   if (options.appActivity) config.device.appActivity = options.appActivity;
   if (options.bundleId) config.device.bundleId = options.bundleId;
-  if (options.model) config.anthropic.model = options.model;
+  if (options.provider) config.llm.provider = options.provider;
+  if (options.model) {
+    if (config.llm.provider === "ollama") config.llm.ollama.model = options.model;
+    else config.llm.anthropic.model = options.model;
+  }
   if (options.vision === false) config.agent.visionEnabled = false;
   if (options.maxIterations) {
     const n = Number.parseInt(options.maxIterations, 10);

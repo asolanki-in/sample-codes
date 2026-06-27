@@ -26,12 +26,12 @@ simulators, and real devices).
             natural-language steps
                      │
                      ▼
-        ┌────────────────────────┐      Claude tool-use
-        │      MobileAgent        │◄────────────────────────┐
-        │  OBSERVE→PLAN→ACT→VERIFY│                          │
-        └────────────┬───────────┘                          │
-                     │ MCP tool calls                 Anthropic API
-                     ▼  (streamable HTTP)                    │
+        ┌────────────────────────┐      LLM tool-use
+        │      MobileAgent        │◄───────────────┐
+        │  OBSERVE→PLAN→ACT→VERIFY│         Ollama Cloud / Anthropic
+        └────────────┬───────────┘                │
+                     │ MCP tool calls             │
+                     ▼  (streamable HTTP)          │
         ┌────────────────────────┐                          │
         │  appium-mcp (httpStream)│──────────────────────────┘
         └────────────┬───────────┘
@@ -84,7 +84,8 @@ simulators, and real devices).
 ## Prerequisites
 
 - **Node.js ≥ 20** (22+ recommended)
-- An **Anthropic API key**
+- An **LLM provider key**: an **Ollama Cloud** key (default,
+  [ollama.com](https://ollama.com)) or an **Anthropic** key
 - A working **Appium** mobile setup, as required by `appium-mcp`:
   - Android: JDK, Android SDK (`ANDROID_HOME`), an emulator or USB device
   - iOS: macOS, Xcode, simulators
@@ -105,7 +106,12 @@ Set values in `.env` (see [`.env.example`](.env.example) for the full list). The
 essentials:
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-...
+# LLM (Ollama Cloud by default)
+LLM_PROVIDER=ollama
+OLLAMA_API_KEY=...                    # from https://ollama.com
+OLLAMA_MODEL=qwen3-coder:480b-cloud   # any cloud model with tool calling
+
+# Device
 PLATFORM=android
 ANDROID_HOME=/path/to/android/sdk     # Android only
 APP_PACKAGE=com.example.app           # optional; can live in the flow instead
@@ -113,6 +119,23 @@ APP_ACTIVITY=.MainActivity
 ```
 
 CLI flags override `.env`.
+
+### LLM providers
+
+The agent is provider-neutral (see [`src/llm/`](src/llm)). Pick one:
+
+- **Ollama Cloud (default)** — set `LLM_PROVIDER=ollama`, `OLLAMA_API_KEY`, and an
+  `OLLAMA_MODEL` that supports **tool calling** (e.g. `qwen3-coder:480b-cloud`,
+  `gpt-oss:120b`, `deepseek-v3.1:671b`). Self-hosted Ollama works too — point
+  `OLLAMA_HOST` at it. Vision is off by default (the text UI snapshot is the
+  primary grounding); enable `OLLAMA_VISION=true` only with a vision+tools model.
+- **Anthropic / Claude** — set `LLM_PROVIDER=anthropic`, `ANTHROPIC_API_KEY`, and
+  optionally `ANTHROPIC_MODEL` (default `claude-sonnet-4-6`). Supports vision.
+
+Override per run with `--provider` and `--model`.
+
+> Tool calling is required. Whichever model you pick must support it, or the
+> agent can't drive the device.
 
 ## Run
 
@@ -236,7 +259,12 @@ src/
   types.ts              shared domain types
   mcp/appiumClient.ts   appium-mcp transport client (httpStream/stdio) + results
   mcp/uiSnapshot.ts     page-source XML -> compact JSON with precomputed locators
-  llm/toolAdapter.ts    MCP tools <-> Anthropic tool-use; result conversion
+  llm/
+    types.ts            provider-neutral LLM types (messages, tools, provider)
+    provider.ts         factory: picks Ollama / Anthropic from config
+    ollamaProvider.ts   Ollama Cloud (native tool calling)
+    anthropicProvider.ts Anthropic / Claude (Messages API)
+    toolAdapter.ts      neutral tool defs + MCP result -> message parts
   agent/
     agent.ts            the observe/plan/act/verify/finish loop
     device.ts           Maestro-style reliability: settle, match, verify, retry

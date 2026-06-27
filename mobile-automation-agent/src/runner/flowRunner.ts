@@ -6,11 +6,11 @@
  * down. Setup/teardown are deterministic; only the steps go through the LLM.
  */
 
-import Anthropic from "@anthropic-ai/sdk";
 import type { AppConfiguration } from "../config.js";
 import type { Logger } from "../logger.js";
 import { AppiumMcpClient } from "../mcp/appiumClient.js";
-import { buildAnthropicTools } from "../llm/toolAdapter.js";
+import { buildToolDefs } from "../llm/toolAdapter.js";
+import { createProvider } from "../llm/provider.js";
 import { MobileAgent } from "../agent/agent.js";
 import { DeviceController } from "../agent/device.js";
 import { buildSystemPrompt } from "../agent/prompts.js";
@@ -53,7 +53,10 @@ export async function runFlow(
 
     const mcpTools = await mcp.listTools();
     logger.info(`Discovered ${mcpTools.length} appium-mcp tools`);
-    const tools = buildAnthropicTools(mcpTools);
+    const tools = buildToolDefs(mcpTools);
+
+    const provider = createProvider(config);
+    logger.info(`LLM provider: ${provider.name} (${provider.model})`);
 
     const session = await createSession(mcp, config, flow, logger);
     platform = session.platform;
@@ -68,15 +71,12 @@ export async function runFlow(
       logger,
     );
 
-    const anthropic = new Anthropic({ apiKey: config.anthropic.apiKey });
     const agent = new MobileAgent({
-      anthropic,
+      provider,
       mcp,
       device,
       tools,
       systemPrompt: buildSystemPrompt({ platform, appHint: appHint(flow, config) }),
-      model: config.anthropic.model,
-      maxTokens: config.anthropic.maxTokens,
       maxStepIterations: config.agent.maxStepIterations,
       visionEnabled: config.agent.visionEnabled,
       logger,
@@ -124,7 +124,9 @@ export async function runFlow(
     await mcp.close();
   }
 
-  return assembleReport(flow, platform, config.anthropic.model, startedAt, stepResults);
+  const model =
+    config.llm.provider === "ollama" ? config.llm.ollama.model : config.llm.anthropic.model;
+  return assembleReport(flow, platform, model, startedAt, stepResults);
 }
 
 interface StepRunResult {

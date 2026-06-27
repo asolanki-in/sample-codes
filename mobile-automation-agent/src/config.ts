@@ -54,9 +54,21 @@ const boolFromString = z
   .transform((v) => v === "true" || v === "1" || v === "yes");
 
 const EnvSchema = z.object({
-  ANTHROPIC_API_KEY: z.string().min(1, "ANTHROPIC_API_KEY is required"),
+  // ---- LLM provider ----
+  LLM_PROVIDER: z.enum(["anthropic", "ollama"]).default("ollama"),
+
+  // Anthropic (used when LLM_PROVIDER=anthropic)
+  ANTHROPIC_API_KEY: z.string().optional(),
   ANTHROPIC_MODEL: z.string().default("claude-sonnet-4-6"),
   ANTHROPIC_MAX_TOKENS: z.coerce.number().int().positive().default(4096),
+
+  // Ollama Cloud (used when LLM_PROVIDER=ollama)
+  OLLAMA_API_KEY: z.string().optional(),
+  OLLAMA_HOST: z.string().url().default("https://ollama.com"),
+  OLLAMA_MODEL: z.string().default("qwen3-coder:480b-cloud"),
+  OLLAMA_MAX_TOKENS: z.coerce.number().int().positive().default(4096),
+  // Send screenshots to Ollama (only with a vision+tools capable model).
+  OLLAMA_VISION: boolFromString.default(false),
 
   // ---- appium-mcp transport ----
   // We talk to appium-mcp over streamable HTTP (httpStream) by default.
@@ -97,11 +109,19 @@ const EnvSchema = z.object({
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
 });
 
+export type LlmProviderKind = "anthropic" | "ollama";
+
 export interface AppConfiguration {
-  anthropic: {
-    apiKey: string;
-    model: string;
-    maxTokens: number;
+  llm: {
+    provider: LlmProviderKind;
+    anthropic: { apiKey?: string; model: string; maxTokens: number };
+    ollama: {
+      host: string;
+      apiKey?: string;
+      model: string;
+      maxTokens: number;
+      vision: boolean;
+    };
   };
   appiumMcp: {
     transport: "httpStream" | "stdio";
@@ -150,6 +170,16 @@ export function loadConfig(): AppConfiguration {
   }
   const env = parsed.data;
 
+  // Validate the credentials required by the selected provider.
+  if (env.LLM_PROVIDER === "anthropic" && !env.ANTHROPIC_API_KEY) {
+    throw new Error("ANTHROPIC_API_KEY is required when LLM_PROVIDER=anthropic");
+  }
+  if (env.LLM_PROVIDER === "ollama" && !env.OLLAMA_API_KEY) {
+    throw new Error(
+      "OLLAMA_API_KEY is required when LLM_PROVIDER=ollama (get one at https://ollama.com)",
+    );
+  }
+
   const passthroughEnv: Record<string, string> = {};
   if (env.ANDROID_HOME) passthroughEnv.ANDROID_HOME = env.ANDROID_HOME;
   if (env.SCREENSHOTS_DIR) passthroughEnv.SCREENSHOTS_DIR = env.SCREENSHOTS_DIR;
@@ -157,10 +187,20 @@ export function loadConfig(): AppConfiguration {
   passthroughEnv.NO_UI = process.env.NO_UI ?? "true";
 
   return {
-    anthropic: {
-      apiKey: env.ANTHROPIC_API_KEY,
-      model: env.ANTHROPIC_MODEL,
-      maxTokens: env.ANTHROPIC_MAX_TOKENS,
+    llm: {
+      provider: env.LLM_PROVIDER,
+      anthropic: {
+        apiKey: env.ANTHROPIC_API_KEY,
+        model: env.ANTHROPIC_MODEL,
+        maxTokens: env.ANTHROPIC_MAX_TOKENS,
+      },
+      ollama: {
+        host: env.OLLAMA_HOST,
+        apiKey: env.OLLAMA_API_KEY,
+        model: env.OLLAMA_MODEL,
+        maxTokens: env.OLLAMA_MAX_TOKENS,
+        vision: env.OLLAMA_VISION,
+      },
     },
     appiumMcp: {
       transport: env.MCP_TRANSPORT,

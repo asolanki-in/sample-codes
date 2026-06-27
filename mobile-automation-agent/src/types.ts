@@ -64,6 +64,38 @@ export interface ToolCallRecord {
   ok: boolean;
   durationMs: number;
   error?: string;
+  /** Present when this call can be replayed deterministically without an LLM. */
+  replay?: ReplayAction;
+}
+
+/** A single deterministic action that can be re-executed during replay. */
+export interface ReplayAction {
+  /** "reliable" = a DeviceController action; "mcp" = a raw appium-mcp tool call. */
+  kind: "reliable" | "mcp";
+  tool: string;
+  input: Record<string, unknown>;
+}
+
+export interface ReplayStep {
+  id: string;
+  text: string;
+  actions: ReplayAction[];
+  expect?: Expectation;
+  /** False when the step did something we couldn't capture deterministically. */
+  replayable: boolean;
+}
+
+/** An AI-authored run captured for deterministic, LLM-free replay. */
+export interface ReplayFlow {
+  name: string;
+  platform: Platform;
+  device?: string;
+  app?: AppConfig;
+  capabilities?: Record<string, unknown>;
+  recordedAt: string;
+  /** The model that authored the recording (for provenance). */
+  model: string;
+  steps: ReplayStep[];
 }
 
 export interface StepResult {

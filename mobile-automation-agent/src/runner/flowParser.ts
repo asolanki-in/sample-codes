@@ -13,7 +13,7 @@ import { readFile } from "node:fs/promises";
 import { basename, extname } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import type { Flow, FlowStep } from "../types.js";
+import type { Flow, FlowStep, ReplayFlow } from "../types.js";
 
 const SelectorSchema = z.union([
   z.string(),
@@ -128,6 +128,61 @@ export async function loadFlowFromFile(path: string): Promise<Flow> {
     }
   }
   return parseTextFlow(content, name);
+}
+
+const ReplayActionSchema = z.object({
+  kind: z.enum(["reliable", "mcp"]),
+  tool: z.string(),
+  input: z.record(z.string(), z.unknown()),
+});
+
+const ReplayFlowSchema = z.object({
+  name: z.string(),
+  platform: z.enum(["android", "ios"]),
+  device: z.string().optional(),
+  app: z
+    .object({
+      appPackage: z.string().optional(),
+      appActivity: z.string().optional(),
+      bundleId: z.string().optional(),
+      appPath: z.string().optional(),
+    })
+    .optional(),
+  capabilities: z.record(z.string(), z.unknown()).optional(),
+  recordedAt: z.string().optional(),
+  model: z.string().optional(),
+  steps: z.array(
+    z.object({
+      id: z.string(),
+      text: z.string(),
+      actions: z.array(ReplayActionSchema),
+      expect: ExpectationSchema.optional(),
+      replayable: z.boolean(),
+    }),
+  ),
+});
+
+/** Load and validate a recorded replay file. */
+export async function loadReplayFlow(path: string): Promise<ReplayFlow> {
+  const content = await readFile(path, "utf8");
+  const parsed = ReplayFlowSchema.safeParse(JSON.parse(content));
+  if (!parsed.success) {
+    const issues = parsed.error.issues
+      .map((i) => `  - ${i.path.join(".") || "(root)"}: ${i.message}`)
+      .join("\n");
+    throw new Error(`Invalid replay file:\n${issues}`);
+  }
+  const r = parsed.data;
+  return {
+    name: r.name,
+    platform: r.platform,
+    device: r.device,
+    app: r.app,
+    capabilities: r.capabilities,
+    recordedAt: r.recordedAt ?? new Date().toISOString(),
+    model: r.model ?? "unknown",
+    steps: r.steps,
+  };
 }
 
 /** Build a flow from steps supplied directly on the CLI. */

@@ -72,6 +72,9 @@ simulators, and real devices).
   derived (accessibility id > resource-id/name > text/predicate > xpath) rather
   than guessing. Exposed as the `inspect_screen` tool and auto-attached at the
   start of each step. See [`src/mcp/uiSnapshot.ts`](src/mcp/uiSnapshot.ts).
+- **Record & deterministic replay** — capture an AI run as a replay file, then
+  re-run it with no LLM/tokens and full verification. AI authors, a deterministic
+  engine runs it in CI. See [Record once, replay forever](#record-once-ai-replay-forever).
 - **Tools are discovered dynamically** from appium-mcp, so new server
   capabilities are available automatically.
 - **Vision** — a screenshot is attached at the start of every step; older
@@ -180,6 +183,38 @@ The agent connects to appium-mcp over **streamable HTTP** by default.
   go in `MCP_HTTP_HEADERS` as JSON.
 - **stdio fallback:** set `MCP_TRANSPORT=stdio` to spawn appium-mcp and speak
   over its stdio instead.
+
+## Record once (AI), replay forever (deterministic)
+
+The agent is great for *authoring* a flow, but you don't want to pay an LLM — or
+tolerate its variance — every CI run. So a run can **record** the exact resolved
+actions, and `replay` re-executes them with **no LLM and no tokens**:
+
+```bash
+# 1. Author with the agent, capturing a replay recording + evidence
+mobile-agent run flows/signup.flow.yaml --record signup.replay.json --artifacts runs/signup
+
+# 2. Re-run it deterministically (CI) — no API key needed for the LLM
+mobile-agent replay signup.replay.json --report runs/ci.json
+```
+
+- The recording stores each step's **resolved actions** — reliable actions
+  (`tap{text:"Continue"}`, `input_text`, `toggle`, …) keep their *queries*, so on
+  replay they **re-resolve and re-verify** against the live screen (robust to
+  minor layout shifts), not brittle absolute coordinates. Raw appium calls are
+  recorded too, except UUID-bound ones (session-scoped) which can't replay.
+- Replay keeps all the reliability guarantees: settle, tolerant match,
+  verify-and-retry, and your `expect` assertions are re-checked. A step that the
+  recording couldn't capture deterministically is flagged and skipped with a
+  warning rather than silently passing.
+- This is the "AI authors, deterministic engine runs" model that Maestro,
+  agent-device and finalrun converge on — fast, free, and stable in CI.
+
+## Evidence / artifacts
+
+`--artifacts <dir>` writes, for every step, a screenshot
+(`step-<n>-<status>.png`) plus the JSON `report.json` and a `replay.json`, so a
+failed run leaves something an engineer can actually inspect.
 
 ## How actions are verified
 
@@ -312,9 +347,9 @@ src/
     device.ts           Maestro-style reliability: settle, match, verify, retry
     prompts.ts          system prompt + interaction playbooks
   runner/
-    flowRunner.ts       orchestration: connect → session → steps → report
+    flowRunner.ts       orchestration: AI run + record, and deterministic replay
     session.ts          deterministic capabilities + session lifecycle
-    flowParser.ts       YAML/JSON/text/inline flow loading
+    flowParser.ts       YAML/JSON/text/inline flow + replay-file loading
     report.ts           console summary + JSON report
 flows/                  example flows
 ```

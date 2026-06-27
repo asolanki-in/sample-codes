@@ -28,7 +28,7 @@ import type {
   ToolDef,
   ToolMessage,
 } from "../llm/types.js";
-import type { DeviceController, ElementQuery } from "./device.js";
+import { dispatchAction, type DeviceController } from "./device.js";
 import { STEP_COMPLETE_TOOL, buildStepInstruction } from "./prompts.js";
 
 /** How many recent screenshots to retain in history. */
@@ -196,6 +196,11 @@ export class MobileAgent {
       ok: !result.isError,
       durationMs,
       ...(result.isError ? { error: result.text.slice(0, 500) } : {}),
+      // Capture raw mutations for replay (skip observations + uuid-bound calls
+      // whose ids won't survive into a new session).
+      ...(isReplayableMcp(call.name, call.input)
+        ? { replay: { kind: "mcp" as const, tool: call.name, input: call.input } }
+        : {}),
     };
     return { record, parts: toToolResultParts(result), isError: result.isError };
   }
@@ -217,6 +222,8 @@ export class MobileAgent {
       ok: result.ok,
       durationMs,
       ...(result.ok ? {} : { error: result.message }),
+      // Reliable actions are always deterministically replayable.
+      ...(result.ok ? { replay: { kind: "reliable" as const, tool: call.name, input: call.input } } : {}),
     };
     const text = `${result.ok ? "OK" : "FAILED"}: ${result.message}\n${result.snapshot}`;
     return { record, parts: [{ type: "text", text }], isError: !result.ok };
@@ -224,34 +231,7 @@ export class MobileAgent {
 
   /** Dispatch a reliable-action tool name to the DeviceController. */
   private runAction(name: string, args: Record<string, unknown>) {
-    const device = this.deps.device;
-    const q = args as ElementQuery & {
-      x?: number;
-      y?: number;
-      text?: string;
-      to?: "on" | "off";
-      into?: ElementQuery;
-      clear?: boolean;
-      timeoutMs?: number;
-      direction?: "up" | "down" | "left" | "right";
-      maxScrolls?: number;
-    };
-    switch (name) {
-      case "tap":
-        return device.tap(q);
-      case "input_text":
-        return device.inputText({ text: q.text ?? "", into: q.into, clear: q.clear });
-      case "assert_visible":
-        return device.assertVisible(q, q.timeoutMs);
-      case "scroll_until_visible":
-        return device.scrollUntilVisible(q);
-      case "toggle":
-        return device.toggle({ text: q.text ?? "", to: q.to });
-      case "back":
-        return device.back();
-      default:
-        return Promise.resolve({ ok: false, message: `Unknown action ${name}`, snapshot: "" });
-    }
+    return dispatchAction(this.deps.device, name, args);
   }
 
   /** Settle the UI and return the compact snapshot text, or null if unavailable. */
@@ -312,6 +292,27 @@ export class MobileAgent {
 
 function toolMsg(call: ToolCall, parts: Part[], isError = false): ToolMessage {
   return { role: "tool", toolCallId: call.id, name: call.name, parts, isError };
+}
+
+/** Raw appium-mcp calls we can safely replay: mutations without an element UUID. */
+const NON_REPLAYABLE_MCP = new Set([
+  "appium_get_page_source",
+  "appium_screenshot",
+  "appium_get_text",
+  "appium_find_element",
+  "appium_get_window_size",
+  "appium_session_management",
+  "appium_mobile_device_info",
+  "select_device",
+  "generate_locators",
+]);
+
+function isReplayableMcp(name: string, input: Record<string, unknown>): boolean {
+  if (!name.startsWith("appium_")) return false;
+  if (NON_REPLAYABLE_MCP.has(name)) return false;
+  // UUIDs are session-scoped and won't resolve on replay.
+  if (typeof input.elementUUID === "string") return false;
+  return true;
 }
 
 function prune(replacers: Array<() => void>, keep: number): void {

@@ -11,8 +11,8 @@
 import { Command, Option } from "commander";
 import { loadConfig, type AppConfiguration } from "./config.js";
 import { createLogger } from "./logger.js";
-import { flowFromInlineSteps, loadFlowFromFile } from "./runner/flowParser.js";
-import { runFlow } from "./runner/flowRunner.js";
+import { flowFromInlineSteps, loadFlowFromFile, loadReplayFlow } from "./runner/flowParser.js";
+import { runFlow, runReplay } from "./runner/flowRunner.js";
 import { printReport, writeReport } from "./runner/report.js";
 import type { Flow, Platform } from "./types.js";
 
@@ -27,10 +27,21 @@ interface RunOptions {
   model?: string;
   maxIterations?: string;
   report?: string;
+  record?: string;
+  artifacts?: string;
   vision: boolean;
   keepSession?: boolean;
   continueOnFailure?: boolean;
   dryRun?: boolean;
+}
+
+interface ReplayOptions {
+  platform?: Platform;
+  device?: string;
+  report?: string;
+  artifacts?: string;
+  keepSession?: boolean;
+  continueOnFailure?: boolean;
 }
 
 const program = new Command();
@@ -56,12 +67,28 @@ program
   .option("-m, --model <model>", "model override for the active provider")
   .option("--max-iterations <n>", "max model<->device round trips per step")
   .option("-r, --report <path>", "write a JSON report to this path")
+  .option("--record <path>", "record a deterministic replay file of this run")
+  .option("--artifacts <dir>", "write per-step screenshots + report to this directory")
   .option("--no-vision", "disable sending screenshots to the model")
   .option("--keep-session", "do not delete the Appium session after the run")
   .option("--continue-on-failure", "keep running later steps after a required step fails")
   .option("--dry-run", "parse and print the flow without executing it")
   .action(async (flowFile: string | undefined, options: RunOptions) => {
     await runCommand(flowFile, options);
+  });
+
+program
+  .command("replay")
+  .description("Re-run a recorded flow deterministically (no LLM, no tokens)")
+  .argument("<replayFile>", "path to a replay file produced by `run --record`")
+  .addOption(new Option("-p, --platform <platform>", "target platform").choices(["android", "ios"]))
+  .option("-d, --device <name>", "device/emulator/simulator udid or name")
+  .option("-r, --report <path>", "write a JSON report to this path")
+  .option("--artifacts <dir>", "write per-step screenshots + report to this directory")
+  .option("--keep-session", "do not delete the Appium session after the run")
+  .option("--continue-on-failure", "keep running later steps after a failure")
+  .action(async (replayFile: string, options: ReplayOptions) => {
+    await replayCommand(replayFile, options);
   });
 
 async function runCommand(flowFile: string | undefined, options: RunOptions): Promise<void> {
@@ -107,6 +134,8 @@ async function runCommand(flowFile: string | undefined, options: RunOptions): Pr
     const report = await runFlow(flow, config, logger, {
       keepSession: options.keepSession,
       stopOnFailure: !options.continueOnFailure,
+      recordPath: options.record,
+      artifactsDir: options.artifacts,
     });
 
     printReport(report, logger);
@@ -118,6 +147,42 @@ async function runCommand(flowFile: string | undefined, options: RunOptions): Pr
     process.exitCode = report.status === "passed" ? 0 : 1;
   } catch (err) {
     logger.error(`Run failed: ${(err as Error).message}`, err);
+    process.exitCode = 1;
+  }
+}
+
+async function replayCommand(replayFile: string, options: ReplayOptions): Promise<void> {
+  let config: AppConfiguration;
+  try {
+    config = loadConfig();
+  } catch (err) {
+    process.stderr.write(`${(err as Error).message}\n`);
+    process.exitCode = 2;
+    return;
+  }
+
+  if (options.platform) config.device.platform = options.platform;
+  if (options.device) config.device.deviceName = options.device;
+  const logger = createLogger(config.logLevel, "mobile-agent");
+
+  try {
+    const replay = await loadReplayFlow(replayFile);
+    logger.info(`Replaying "${replay.name}" (${replay.platform}, recorded by ${replay.model})`);
+
+    const report = await runReplay(replay, config, logger, {
+      keepSession: options.keepSession,
+      stopOnFailure: !options.continueOnFailure,
+      artifactsDir: options.artifacts,
+    });
+
+    printReport(report, logger);
+    if (options.report) {
+      await writeReport(report, options.report);
+      logger.info(`Report written to ${options.report}`);
+    }
+    process.exitCode = report.status === "passed" ? 0 : 1;
+  } catch (err) {
+    logger.error(`Replay failed: ${(err as Error).message}`, err);
     process.exitCode = 1;
   }
 }

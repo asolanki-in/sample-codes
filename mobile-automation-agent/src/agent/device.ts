@@ -479,6 +479,47 @@ export class DeviceController {
 // pure helpers
 // ---------------------------------------------------------------------------
 
+/** Arguments accepted by the high-level reliable actions. */
+export type ReliableActionArgs = ElementQuery & {
+  x?: number;
+  y?: number;
+  text?: string;
+  to?: "on" | "off";
+  into?: ElementQuery;
+  clear?: boolean;
+  timeoutMs?: number;
+  direction?: "up" | "down" | "left" | "right";
+  maxScrolls?: number;
+};
+
+/**
+ * Dispatch a reliable-action by name to the DeviceController. Shared by the
+ * agent loop and the deterministic replay engine so both behave identically.
+ */
+export function dispatchAction(
+  device: DeviceController,
+  name: string,
+  args: Record<string, unknown>,
+): Promise<ActionResult> {
+  const q = args as ReliableActionArgs;
+  switch (name) {
+    case "tap":
+      return device.tap(q);
+    case "input_text":
+      return device.inputText({ text: q.text ?? "", into: q.into, clear: q.clear });
+    case "assert_visible":
+      return device.assertVisible(q, q.timeoutMs);
+    case "scroll_until_visible":
+      return device.scrollUntilVisible(q);
+    case "toggle":
+      return device.toggle({ text: q.text ?? "", to: q.to });
+    case "back":
+      return device.back();
+    default:
+      return Promise.resolve({ ok: false, message: `Unknown action ${name}`, snapshot: "" });
+  }
+}
+
 type Relation = "below" | "above" | "leftOf" | "rightOf";
 
 function isEditable(el: UiElement): boolean {

@@ -4,6 +4,21 @@
 
 export type Platform = "android" | "ios";
 
+/** A way to point at an element for an assertion (string = match by text). */
+export type StepSelector = string | { text?: string; id?: string; accessibilityId?: string };
+
+/**
+ * Author-declared, deterministic post-conditions for a step. These are checked
+ * by the runner AFTER the agent finishes — independent of the agent's own
+ * success/failure self-report — and are authoritative.
+ */
+export interface Expectation {
+  /** These element(s) must be visible after the step. */
+  visible?: StepSelector | StepSelector[];
+  /** These element(s) must NOT be visible after the step. */
+  notVisible?: StepSelector | StepSelector[];
+}
+
 /** A single natural-language instruction the agent must accomplish. */
 export interface FlowStep {
   /** Stable identifier, auto-assigned if omitted (step-1, step-2, ...). */
@@ -14,6 +29,8 @@ export interface FlowStep {
   optional: boolean;
   /** How many times to retry the whole step on failure (default 0). */
   retries: number;
+  /** Optional deterministic post-conditions verified by the runner. */
+  expect?: Expectation;
 }
 
 /** App-under-test coordinates. */

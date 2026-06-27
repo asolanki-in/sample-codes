@@ -181,6 +181,48 @@ The agent connects to appium-mcp over **streamable HTTP** by default.
 - **stdio fallback:** set `MCP_TRANSPORT=stdio` to spawn appium-mcp and speak
   over its stdio instead.
 
+## How actions are verified
+
+The agent is **not** trusted blindly. Verification happens at three layers:
+
+1. **Per-action post-conditions (deterministic, in code).**
+   - `tap` — settles the UI and compares the view hierarchy before/after; if
+     nothing changed it retries, and the result reports whether the UI actually
+     changed.
+   - `input_text` — reads the field value back after typing and **fails** if the
+     expected text didn't land (alphanumeric, case-insensitive comparison;
+     password fields are reported as unverifiable). No more "typed into the void".
+   - `toggle` — re-reads the switch/checkbox state and confirms it matches the
+     requested state.
+   - `assert_visible` / `scroll_until_visible` — poll the real hierarchy for the
+     element; they are verifiers by definition.
+
+2. **Author-declared step assertions (deterministic, authoritative).** A step can
+   declare post-conditions that the **runner** checks after the agent finishes —
+   independent of what the agent claimed. If they fail, the step fails:
+
+   ```yaml
+   - text: Tap on Continue
+     expect:
+       visible: Username          # must be on screen afterwards
+       notVisible: Error message  # must not be
+   ```
+
+   `visible` / `notVisible` accept a string (matched by text) or
+   `{ text | id | accessibilityId }`, and a single value or a list.
+
+3. **Agent self-report (lowest trust).** The model ends each step with
+   `report_step_result`. This is the weakest signal and is **overridden** by the
+   checks above — a step the model calls "success" still fails if its `expect`
+   assertions or an `input_text` read-back fail.
+
+So: trust deterministic post-conditions and your `expect` assertions; the agent's
+own verdict is only the fallback when you haven't declared anything to check.
+
+> Tip: add `expect` to the steps whose outcome matters (login succeeded, screen
+> changed). That converts a flow from "the agent thinks it worked" into a real,
+> repeatable test.
+
 ## Flow formats
 
 **YAML / JSON** (structured):

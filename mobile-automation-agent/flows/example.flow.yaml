@@ -15,7 +15,10 @@ app:
   appActivity: .MainActivity
 
 steps:
-  - Tap on Continue
+  - text: Tap on Continue
+    # Deterministic post-condition, checked by the runner (not the agent):
+    expect:
+      visible: Username
   - text: Enter username as hello
     retries: 1
   - Enter date of birth as 01 01 1990

@@ -36,8 +36,8 @@ For the CURRENT step you must:
 1. OBSERVE: understand the current screen. A compact UI snapshot (and usually a screenshot) is attached. To refresh it call \`inspect_screen\` (it waits for the UI to settle first). Only fall back to \`appium_get_page_source\` (raw XML) for rare attributes the snapshot omits.
 2. PLAN: decide the minimal set of actions that accomplish the step.
 3. ACT: call appium-mcp tools to perform those actions.
-4. VERIFY: confirm the screen changed as expected (re-screenshot or re-read source if unsure).
-5. FINISH: call \`${STEP_COMPLETE_TOOL}\` with status "success" once the step is done, or "failure" if it genuinely cannot be completed. You MUST end every step by calling \`${STEP_COMPLETE_TOOL}\`.
+4. VERIFY: confirm the outcome. The reliable tools already self-verify (a tap reports whether the UI changed; \`input_text\` reads the field back and FAILS if the value didn't land; \`toggle\` re-reads the switch state). Read each tool result: if it says FAILED or "no UI change", do not assume success — re-observe and fix it. To confirm a screen/result, use \`assert_visible\`.
+5. FINISH: call \`${STEP_COMPLETE_TOOL}\` with status "success" only when the tool results actually confirm it, or "failure" if it genuinely cannot be completed. Do not report success on the basis of a FAILED tool result. You MUST end every step by calling \`${STEP_COMPLETE_TOOL}\`. (Note: steps may also carry author-defined assertions the runner checks independently — a false "success" will still be caught.)
 
 # The UI snapshot
 \`inspect_screen\` (and the snapshot attached at the start of each step) returns JSON like:

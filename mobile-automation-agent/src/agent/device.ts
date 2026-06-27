@@ -270,6 +270,9 @@ export class DeviceController {
    * setValue (focuses + replaces); otherwise we type into the focused element.
    */
   async inputText(args: { text: string; into?: ElementQuery; clear?: boolean }): Promise<ActionResult> {
+    let label = "the focused field";
+    let toolError = false;
+
     if (args.into) {
       const found = await this.waitForMatch(args.into);
       if (!found.element) {
@@ -278,21 +281,74 @@ export class DeviceController {
       // The match may be a static label above an unlabeled field — resolve to
       // the actual editable element.
       const field = this.findInputFor(found.snapshot, found.element) ?? found.element;
-      const viaLabel = field !== found.element ? " (field below the label)" : "";
+      label = describe(args.into) + (field !== found.element ? " (field below the label)" : "");
 
       const uuid = await this.resolveUuid(field);
       if (uuid) {
         const res = await this.mcp.callTool("appium_set_value", { elementUUID: uuid, text: args.text });
-        const after = await this.waitForStableHierarchy();
-        return this.result(!res.isError, `Entered text into ${describe(args.into)}${viaLabel}.`, after, true);
+        toolError = res.isError;
+      } else {
+        // No locator (unlabeled field): focus by tapping its center, then type.
+        if (field.c) await this.tapAt(field.c[0], field.c[1]);
+        const res = await this.mcp.callTool("appium_set_value", { text: args.text, w3cActions: true });
+        toolError = res.isError;
       }
-      // No locator (unlabeled field): focus by tapping its center, then type.
-      if (field.c) await this.tapAt(field.c[0], field.c[1]);
+    } else {
+      const res = await this.mcp.callTool("appium_set_value", { text: args.text, w3cActions: true });
+      toolError = res.isError;
     }
 
-    const res = await this.mcp.callTool("appium_set_value", { text: args.text, w3cActions: true });
     const after = await this.waitForStableHierarchy();
-    return this.result(!res.isError, `Typed "${args.text}" into the focused field.`, after, true);
+    if (toolError) {
+      return this.result(false, `Failed to enter text into ${label}.`, after, true);
+    }
+
+    // VERIFY: read the field's value back and confirm it took the input.
+    const verdict = this.verifyInput(after, args.text, args.into);
+    return this.result(verdict.ok, `${verdict.message} (${label})`, after, true);
+  }
+
+  /**
+   * Independent verification that text actually landed in a field: re-locate the
+   * field after typing and compare its value to what we sent (alphanumeric,
+   * case-insensitive — tolerant of formatting/masks). Password fields can't be
+   * read, so they're reported as unverifiable rather than failed.
+   */
+  private verifyInput(
+    xml: string,
+    expected: string,
+    into?: ElementQuery,
+  ): { ok: boolean; message: string } {
+    const snapshot = buildSnapshot(xml, this.opts.platform);
+    let field: UiElement | undefined;
+    if (into) {
+      const match = this.match(snapshot, into)[0];
+      if (match) field = this.findInputFor(snapshot, match) ?? match;
+    } else {
+      field =
+        snapshot.elements.find((e) => e.state?.includes("focused") && isEditable(e)) ??
+        snapshot.elements.find(isEditable);
+    }
+
+    if (!field) return { ok: true, message: `Entered "${expected}"; could not re-locate field to verify` };
+    if (field.state?.includes("password")) {
+      return { ok: true, message: `Entered text into a password field (value hidden, not verified)` };
+    }
+
+    const actual = field.val ?? field.text ?? "";
+    if (containsNormalized(actual, expected)) {
+      return { ok: true, message: `Entered & verified "${expected}" (field shows "${actual}")` };
+    }
+    return {
+      ok: false,
+      message: `Verification FAILED: typed "${expected}" but field shows "${actual}"`,
+    };
+  }
+
+  /** Quick boolean visibility check (used by step-level assertions). */
+  async isVisible(query: ElementQuery, timeoutMs?: number): Promise<boolean> {
+    const found = await this.waitForMatch(query, timeoutMs ?? this.opts.findTimeoutMs);
+    return Boolean(found.element);
   }
 
   /** Poll until an element is visible, or fail after the timeout. */
@@ -510,6 +566,15 @@ function scoreElement(el: UiElement, query: ElementQuery): number {
     if (/clickable|checkable|editable/.test(el.state)) best += 5;
   }
   return best;
+}
+
+/** Tolerant containment: compare alphanumerics only, case-insensitive. */
+function containsNormalized(haystack: string, needle: string): boolean {
+  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const h = norm(haystack);
+  const n = norm(needle);
+  if (n.length === 0) return true;
+  return h.includes(n);
 }
 
 function fieldScore(value: string | undefined, query: string, exactOnly: boolean): number {

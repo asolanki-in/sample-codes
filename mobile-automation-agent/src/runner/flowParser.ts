@@ -15,6 +15,20 @@ import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import type { Flow, FlowStep } from "../types.js";
 
+const SelectorSchema = z.union([
+  z.string(),
+  z.object({
+    text: z.string().optional(),
+    id: z.string().optional(),
+    accessibilityId: z.string().optional(),
+  }),
+]);
+
+const ExpectationSchema = z.object({
+  visible: z.union([SelectorSchema, z.array(SelectorSchema)]).optional(),
+  notVisible: z.union([SelectorSchema, z.array(SelectorSchema)]).optional(),
+});
+
 const RawStepSchema = z.union([
   z.string(),
   z.object({
@@ -22,6 +36,7 @@ const RawStepSchema = z.union([
     text: z.string().min(1, "step text cannot be empty"),
     optional: z.boolean().optional(),
     retries: z.number().int().min(0).optional(),
+    expect: ExpectationSchema.optional(),
   }),
 ]);
 
@@ -52,6 +67,7 @@ function normaliseSteps(raw: z.infer<typeof RawStepSchema>[]): FlowStep[] {
       text: s.text.trim(),
       optional: s.optional ?? false,
       retries: s.retries ?? 0,
+      ...(s.expect ? { expect: s.expect } : {}),
     };
   });
 }

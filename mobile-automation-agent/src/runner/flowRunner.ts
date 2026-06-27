@@ -12,10 +12,10 @@ import { AppiumMcpClient } from "../mcp/appiumClient.js";
 import { buildToolDefs } from "../llm/toolAdapter.js";
 import { createProvider } from "../llm/provider.js";
 import { MobileAgent } from "../agent/agent.js";
-import { DeviceController } from "../agent/device.js";
+import { DeviceController, type ElementQuery } from "../agent/device.js";
 import { buildSystemPrompt } from "../agent/prompts.js";
 import { createSession, deleteSession } from "./session.js";
-import type { Flow, FlowReport, Platform, StepResult } from "../types.js";
+import type { Expectation, Flow, FlowReport, Platform, StepResult, StepSelector } from "../types.js";
 
 export interface RunFlowOptions {
   keepSession?: boolean;
@@ -109,9 +109,22 @@ export async function runFlow(
         startedAt: result.startedAt,
         finishedAt: result.finishedAt,
       };
+      // VERIFY: if the author declared post-conditions, check them
+      // deterministically — this overrides the agent's own self-report.
+      if (stepResult.status === "success" && step.expect) {
+        const verdict = await verifyExpectations(device, step.expect, logger);
+        if (!verdict.ok) {
+          stepResult.status = "failure";
+          stepResult.summary = `Assertion failed: ${verdict.message}`;
+          logger.warn(`Step ${index} assertion failed: ${verdict.message}`);
+        } else {
+          stepResult.summary += ` | verified: ${verdict.message}`;
+        }
+      }
+
       stepResults.push(stepResult);
 
-      if (result.outcome.status === "failure" && !step.optional && stopOnFailure) {
+      if (stepResult.status === "failure" && !step.optional && stopOnFailure) {
         logger.error(`Aborting flow: required step "${step.text}" failed.`);
         aborted = true;
       }
@@ -162,6 +175,48 @@ async function runStepWithRetries(
     startedAt,
     finishedAt: new Date(end).toISOString(),
   };
+}
+
+/** Deterministically check author-declared post-conditions for a step. */
+async function verifyExpectations(
+  device: DeviceController,
+  expect: Expectation,
+  logger: Logger,
+): Promise<{ ok: boolean; message: string }> {
+  const checks: string[] = [];
+
+  for (const sel of toArray(expect.visible)) {
+    logger.debug(`assert visible: ${describeSelector(sel)}`);
+    if (!(await device.isVisible(toQuery(sel)))) {
+      return { ok: false, message: `expected visible ${describeSelector(sel)}` };
+    }
+    checks.push(`visible ${describeSelector(sel)}`);
+  }
+
+  for (const sel of toArray(expect.notVisible)) {
+    logger.debug(`assert NOT visible: ${describeSelector(sel)}`);
+    // Short timeout: we're confirming absence, no need to wait the full window.
+    if (await device.isVisible(toQuery(sel), 1500)) {
+      return { ok: false, message: `expected NOT visible ${describeSelector(sel)}` };
+    }
+    checks.push(`not-visible ${describeSelector(sel)}`);
+  }
+
+  return { ok: true, message: checks.join(", ") || "no checks" };
+}
+
+function toArray(sel: StepSelector | StepSelector[] | undefined): StepSelector[] {
+  if (sel === undefined) return [];
+  return Array.isArray(sel) ? sel : [sel];
+}
+
+function toQuery(sel: StepSelector): ElementQuery {
+  return typeof sel === "string" ? { text: sel } : sel;
+}
+
+function describeSelector(sel: StepSelector): string {
+  if (typeof sel === "string") return `"${sel}"`;
+  return JSON.stringify(sel);
 }
 
 function appHint(flow: Flow, config: AppConfiguration): string | undefined {

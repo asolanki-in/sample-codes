@@ -120,8 +120,20 @@ export class MobileAgent {
 
       const toolMessages: ToolMessage[] = [];
       let finished: RunStepOutcome | null = null;
+      // When the model batches several tool calls in one turn, abort the rest as
+      // soon as one fails: later calls would run against now-stale device state
+      // and cascade errors (mobile-use's sequential-executor behaviour). We still
+      // emit a tool result for every call id (required by the API).
+      let aborting = false;
 
       for (const call of result.toolCalls) {
+        if (aborting) {
+          toolMessages.push(
+            toolMsg(call, [{ type: "text", text: "Skipped: an earlier tool call in this turn failed. Re-observe the screen and retry." }], true),
+          );
+          continue;
+        }
+
         if (call.name === STEP_COMPLETE_TOOL) {
           const input = call.input as { status?: string; summary?: string; details?: string };
           finished = {
@@ -143,16 +155,12 @@ export class MobileAgent {
           continue;
         }
 
-        if (RELIABLE_ACTION_NAMES.has(call.name)) {
-          const { record, parts: rparts, isError } = await this.executeReliableAction(call);
-          toolCalls.push(record);
-          toolMessages.push(toolMsg(call, rparts, isError));
-          continue;
-        }
-
-        const { record, parts: rparts, isError } = await this.executeTool(call);
+        const { record, parts: rparts, isError } = RELIABLE_ACTION_NAMES.has(call.name)
+          ? await this.executeReliableAction(call)
+          : await this.executeTool(call);
         toolCalls.push(record);
         toolMessages.push(toolMsg(call, rparts, isError));
+        if (isError) aborting = true;
       }
 
       this.messages.push(...toolMessages);

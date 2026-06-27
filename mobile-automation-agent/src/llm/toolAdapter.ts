@@ -39,6 +39,92 @@ export const inspectScreenTool: AnthropicTool = {
   },
 };
 
+const elementQueryProps = {
+  text: { type: "string", description: "Match by visible text / accessibility id / value (case-insensitive, substring OK)." },
+  id: { type: "string", description: "Match by resource-id (Android) substring." },
+  accessibilityId: { type: "string", description: "Match by exact accessibility id / content-desc / name." },
+  index: { type: "number", description: "0-based index to pick when several elements match." },
+} as const;
+
+/**
+ * High-level, reliable interaction tools (Maestro-style). Each one waits for the
+ * UI to settle, finds the element with tolerant matching and an implicit wait,
+ * acts, verifies, retries on no-op, and returns a fresh settled snapshot. PREFER
+ * these over the raw appium_* primitives.
+ */
+export const reliableActionTools: AnthropicTool[] = [
+  {
+    name: "tap",
+    description:
+      "Reliably tap an element. Waits for it to appear, taps it, confirms the UI changed and retries if not. " +
+      "Identify the element by text/id/accessibilityId (or pass raw x,y coordinates).",
+    input_schema: {
+      type: "object",
+      properties: {
+        ...elementQueryProps,
+        x: { type: "number", description: "Raw X coordinate (alternative to a selector)." },
+        y: { type: "number", description: "Raw Y coordinate (use together with x)." },
+      },
+    },
+  },
+  {
+    name: "input_text",
+    description:
+      "Type text. Optionally target a field via `into` (it will be focused and its value replaced); " +
+      "otherwise types into the currently focused field.",
+    input_schema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "The text to enter." },
+        into: { type: "object", description: "Optional field selector.", properties: { ...elementQueryProps } },
+        clear: { type: "boolean", description: "Reserved: replace existing contents." },
+      },
+      required: ["text"],
+    },
+  },
+  {
+    name: "assert_visible",
+    description: "Wait (with implicit timeout) until an element is visible. Fails if it never appears.",
+    input_schema: { type: "object", properties: { ...elementQueryProps, timeoutMs: { type: "number" } } },
+  },
+  {
+    name: "scroll_until_visible",
+    description: "Scroll in a direction until the element becomes visible.",
+    input_schema: {
+      type: "object",
+      properties: {
+        ...elementQueryProps,
+        direction: { type: "string", enum: ["up", "down", "left", "right"], description: "Default down." },
+        maxScrolls: { type: "number", description: "Max scroll attempts (default 10)." },
+      },
+    },
+  },
+  {
+    name: "toggle",
+    description:
+      "State-aware switch/checkbox toggle. Reads the current state and only taps when it differs from the desired state. " +
+      "Omit `to` to flip; set to 'on'/'off' to ensure a state.",
+    input_schema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "Label of the switch/checkbox." },
+        to: { type: "string", enum: ["on", "off"], description: "Desired state; omit to flip." },
+      },
+      required: ["text"],
+    },
+  },
+  {
+    name: "back",
+    description: "Navigate back (Android back button / iOS nav pop), then wait for the UI to settle.",
+    input_schema: { type: "object", properties: {} },
+  },
+];
+
+/** Names of the high-level reliable tools (handled locally, not via raw MCP). */
+export const RELIABLE_ACTION_NAMES: ReadonlySet<string> = new Set(
+  reliableActionTools.map((t) => t.name),
+);
+
 /** The synthetic tool the agent calls to end a step. */
 export const reportStepResultTool: AnthropicTool = {
   name: STEP_COMPLETE_TOOL,
@@ -73,6 +159,7 @@ export function buildAnthropicTools(mcpTools: McpToolDefinition[]): AnthropicToo
     description: t.description,
     input_schema: normaliseSchema(t.inputSchema),
   }));
+  tools.push(...reliableActionTools);
   tools.push(inspectScreenTool);
   tools.push(reportStepResultTool);
   return tools;

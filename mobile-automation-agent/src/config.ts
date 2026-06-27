@@ -88,6 +88,9 @@ const EnvSchema = z.object({
   ANDROID_HOME: z.string().optional(),
 
   MAX_STEP_ITERATIONS: z.coerce.number().int().positive().default(14),
+  // Maestro-style reliability knobs.
+  SETTLE_TIMEOUT_MS: z.coerce.number().int().positive().default(7000),
+  FIND_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),
   VISION_ENABLED: boolFromString.default(true),
   SCREENSHOTS_DIR: z.string().default("./screenshots"),
 
@@ -130,6 +133,8 @@ export interface AppConfiguration {
   agent: {
     maxStepIterations: number;
     visionEnabled: boolean;
+    settleTimeoutMs: number;
+    findTimeoutMs: number;
   };
   logLevel: LogLevel;
 }
@@ -182,6 +187,8 @@ export function loadConfig(): AppConfiguration {
     agent: {
       maxStepIterations: env.MAX_STEP_ITERATIONS,
       visionEnabled: env.VISION_ENABLED,
+      settleTimeoutMs: env.SETTLE_TIMEOUT_MS,
+      findTimeoutMs: env.FIND_TIMEOUT_MS,
     },
     logLevel: env.LOG_LEVEL,
   };

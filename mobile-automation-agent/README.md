@@ -52,6 +52,17 @@ simulators, and real devices).
   auto-spawned locally (`appium-mcp --httpStream --port=8080`, endpoint `/sse`)
   or you can attach to a shared/remote server via `MCP_HTTP_URL`. Set
   `MCP_TRANSPORT=stdio` to fall back to stdio.
+- **Maestro-style reliability layer** — high-level tools (`tap`, `input_text`,
+  `assert_visible`, `scroll_until_visible`, `toggle`, `back`) wrap every
+  interaction in deterministic robustness, so stability doesn't depend on the
+  model: (1) **wait-for-settle** — poll the view hierarchy until it stops
+  changing before observing/acting (no `sleep`s); (2) **implicit wait** — poll
+  for the target element to appear before failing; (3) **tolerant matching** —
+  case-insensitive exact→prefix→substring over text/accessibility/id; (4)
+  **verify-and-retry** — after a tap, confirm the hierarchy actually changed and
+  retry if it didn't. See [`src/agent/device.ts`](src/agent/device.ts). The raw
+  `appium_*` tools stay available for the rest (date-picker wheels, swipes,
+  alerts, app lifecycle).
 - **Compact UI snapshot for element finding** — instead of dumping raw,
   truncated page-source XML at the model, the agent parses it once and hands the
   model a small JSON list of only the *actionable* elements, each with a
@@ -211,6 +222,7 @@ src/
   llm/toolAdapter.ts    MCP tools <-> Anthropic tool-use; result conversion
   agent/
     agent.ts            the observe/plan/act/verify/finish loop
+    device.ts           Maestro-style reliability: settle, match, verify, retry
     prompts.ts          system prompt + interaction playbooks
   runner/
     flowRunner.ts       orchestration: connect → session → steps → report

@@ -17,10 +17,11 @@ import type { ToolCallRecord } from "../types.js";
 import {
   type AnthropicTool,
   INSPECT_SCREEN_TOOL,
+  RELIABLE_ACTION_NAMES,
   toToolResultContent,
 } from "../llm/toolAdapter.js";
-import { buildSnapshot, renderSnapshot, SNAPSHOT_MARKER } from "../mcp/uiSnapshot.js";
-import type { Platform } from "../types.js";
+import { SNAPSHOT_MARKER } from "../mcp/uiSnapshot.js";
+import type { DeviceController, ElementQuery } from "./device.js";
 import { STEP_COMPLETE_TOOL, buildStepInstruction } from "./prompts.js";
 
 /** How many recent screenshots to retain in history. */
@@ -34,13 +35,13 @@ type ContentBlockParam = Anthropic.ContentBlockParam;
 export interface AgentDeps {
   anthropic: Anthropic;
   mcp: AppiumMcpClient;
+  device: DeviceController;
   tools: AnthropicTool[];
   systemPrompt: string;
   model: string;
   maxTokens: number;
   maxStepIterations: number;
   visionEnabled: boolean;
-  platform: Platform;
   logger: Logger;
 }
 
@@ -169,6 +170,13 @@ export class MobileAgent {
           continue;
         }
 
+        if (RELIABLE_ACTION_NAMES.has(use.name)) {
+          const record = await this.executeReliableAction(use);
+          toolCalls.push(record.record);
+          toolResults.push(record.block);
+          continue;
+        }
+
         const record = await this.executeTool(use);
         toolCalls.push(record.record);
         toolResults.push(record.block);
@@ -225,20 +233,85 @@ export class MobileAgent {
     return { record, block };
   }
 
+  /** Execute a high-level reliable action through the DeviceController. */
+  private async executeReliableAction(
+    use: Anthropic.ToolUseBlock,
+  ): Promise<{ record: ToolCallRecord; block: ContentBlockParam }> {
+    const args = (use.input ?? {}) as Record<string, unknown>;
+    this.log.info(`action ${use.name} ${compact(args)}`);
+
+    const started = Date.now();
+    const result = await this.runAction(use.name, args);
+    const durationMs = Date.now() - started;
+
+    if (!result.ok) this.log.warn(`action ${use.name}: ${result.message}`);
+
+    const record: ToolCallRecord = {
+      tool: use.name,
+      input: args,
+      ok: result.ok,
+      durationMs,
+      ...(result.ok ? {} : { error: result.message }),
+    };
+
+    // Feed the outcome plus a fresh settled snapshot back to the model.
+    const text = `${result.ok ? "OK" : "FAILED"}: ${result.message}\n${result.snapshot}`;
+    const block: ContentBlockParam = {
+      type: "tool_result",
+      tool_use_id: use.id,
+      is_error: !result.ok,
+      content: [{ type: "text", text }],
+    };
+
+    return { record, block };
+  }
+
+  /** Dispatch a reliable-action tool name to the DeviceController. */
+  private runAction(name: string, args: Record<string, unknown>) {
+    const device = this.deps.device;
+    const q = args as ElementQuery & {
+      x?: number;
+      y?: number;
+      text?: string;
+      to?: "on" | "off";
+      into?: ElementQuery;
+      clear?: boolean;
+      timeoutMs?: number;
+      direction?: "up" | "down" | "left" | "right";
+      maxScrolls?: number;
+    };
+    switch (name) {
+      case "tap":
+        return device.tap(q);
+      case "input_text":
+        return device.inputText({ text: q.text ?? "", into: q.into, clear: q.clear });
+      case "assert_visible":
+        return device.assertVisible(q, q.timeoutMs);
+      case "scroll_until_visible":
+        return device.scrollUntilVisible(q);
+      case "toggle":
+        return device.toggle({ text: q.text ?? "", to: q.to });
+      case "back":
+        return device.back();
+      default:
+        return Promise.resolve({
+          ok: false,
+          message: `Unknown action ${name}`,
+          snapshot: "",
+        });
+    }
+  }
+
   /**
-   * Fetch the page source and convert it into the compact UI snapshot text.
-   * Returns null if the source can't be read (e.g. no active session yet).
+   * Settle the UI and return the compact snapshot text, or null if unavailable
+   * (e.g. no active session yet).
    */
   private async captureSnapshot(): Promise<string | null> {
-    const result = await this.deps.mcp.callTool("appium_get_page_source", {});
-    if (result.isError || !result.text || result.text.trim() === "") {
-      this.log.debug(`page source unavailable: ${result.text.slice(0, 120)}`);
-      return null;
-    }
     try {
-      const snapshot = buildSnapshot(result.text, this.deps.platform);
+      const { snapshot, text } = await this.deps.device.snapshot();
+      if (snapshot.count === 0 && !snapshot.size) return null;
       this.log.debug(`snapshot: ${snapshot.count} elements${snapshot.truncated ? " (capped)" : ""}`);
-      return renderSnapshot(snapshot);
+      return text;
     } catch (err) {
       this.log.debug("snapshot build failed", err);
       return null;

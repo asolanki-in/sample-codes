@@ -12,6 +12,7 @@ import type { Logger } from "../logger.js";
 import { AppiumMcpClient } from "../mcp/appiumClient.js";
 import { buildAnthropicTools } from "../llm/toolAdapter.js";
 import { MobileAgent } from "../agent/agent.js";
+import { DeviceController } from "../agent/device.js";
 import { buildSystemPrompt } from "../agent/prompts.js";
 import { createSession, deleteSession } from "./session.js";
 import type { Flow, FlowReport, Platform, StepResult } from "../types.js";
@@ -57,17 +58,27 @@ export async function runFlow(
     const session = await createSession(mcp, config, flow, logger);
     platform = session.platform;
 
+    const device = new DeviceController(
+      mcp,
+      {
+        platform,
+        settleTimeoutMs: config.agent.settleTimeoutMs,
+        findTimeoutMs: config.agent.findTimeoutMs,
+      },
+      logger,
+    );
+
     const anthropic = new Anthropic({ apiKey: config.anthropic.apiKey });
     const agent = new MobileAgent({
       anthropic,
       mcp,
+      device,
       tools,
       systemPrompt: buildSystemPrompt({ platform, appHint: appHint(flow, config) }),
       model: config.anthropic.model,
       maxTokens: config.anthropic.maxTokens,
       maxStepIterations: config.agent.maxStepIterations,
       visionEnabled: config.agent.visionEnabled,
-      platform,
       logger,
     });
 

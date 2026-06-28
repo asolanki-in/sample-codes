@@ -99,6 +99,13 @@ const EnvSchema = z.object({
   APP_PATH: z.string().optional(),
   ANDROID_HOME: z.string().optional(),
 
+  // iOS real-device signing (so XCUITest can build/sign WebDriverAgent).
+  IOS_TEAM_ID: z.string().optional(),
+  IOS_SIGNING_ID: z.string().optional(),
+  WDA_BUNDLE_ID: z.string().optional(),
+  // WebDriverAgent local port; bumped per device in parallel iOS runs.
+  IOS_WDA_LOCAL_PORT: z.coerce.number().int().positive().default(8100),
+
   MAX_STEP_ITERATIONS: z.coerce.number().int().positive().default(14),
   // Maestro-style reliability knobs.
   SETTLE_TIMEOUT_MS: z.coerce.number().int().positive().default(7000),
@@ -149,6 +156,11 @@ export interface AppConfiguration {
     appActivity?: string;
     bundleId?: string;
     appPath?: string;
+    /** iOS signing / WDA settings. */
+    iosTeamId?: string;
+    iosSigningId?: string;
+    wdaBundleId?: string;
+    wdaLocalPort?: number;
   };
   agent: {
     maxStepIterations: number;
@@ -223,6 +235,10 @@ export function loadConfig(): AppConfiguration {
       appActivity: env.APP_ACTIVITY,
       bundleId: env.BUNDLE_ID,
       appPath: env.APP_PATH,
+      iosTeamId: env.IOS_TEAM_ID,
+      iosSigningId: env.IOS_SIGNING_ID,
+      wdaBundleId: env.WDA_BUNDLE_ID,
+      wdaLocalPort: env.IOS_WDA_LOCAL_PORT,
     },
     agent: {
       maxStepIterations: env.MAX_STEP_ITERATIONS,

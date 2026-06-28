@@ -48,6 +48,13 @@ function buildCapabilities(
   } else {
     const bundleId = flow.app?.bundleId ?? config.device.bundleId;
     if (bundleId) caps["appium:bundleId"] = bundleId;
+
+    // Real-device signing so XCUITest can build/sign WebDriverAgent.
+    if (config.device.iosTeamId) caps["appium:xcodeOrgId"] = config.device.iosTeamId;
+    if (config.device.iosSigningId) caps["appium:xcodeSigningId"] = config.device.iosSigningId;
+    if (config.device.wdaBundleId) caps["appium:updatedWDABundleId"] = config.device.wdaBundleId;
+    // Distinct WDA port matters when running several iOS devices in parallel.
+    if (config.device.wdaLocalPort) caps["appium:wdaLocalPort"] = config.device.wdaLocalPort;
   }
 
   // Flow-level raw capabilities win over everything (escape hatch).

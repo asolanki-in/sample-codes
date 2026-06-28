@@ -58,6 +58,10 @@ export function deriveDeviceConfig(
   } catch {
     // leave url as-is if unparseable
   }
+  // iOS: each device needs its own WebDriverAgent port.
+  if (cfg.device.platform === "ios" && base.device.wdaLocalPort) {
+    cfg.device.wdaLocalPort = base.device.wdaLocalPort + index;
+  }
   return cfg;
 }
 

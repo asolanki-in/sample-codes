@@ -184,6 +184,53 @@ The agent connects to appium-mcp over **streamable HTTP** by default.
 - **stdio fallback:** set `MCP_TRANSPORT=stdio` to spawn appium-mcp and speak
   over its stdio instead.
 
+## Running on iOS
+
+iOS automation requires **macOS + Xcode** (the XCUITest driver and WebDriverAgent
+are macOS-only). appium-mcp ships the XCUITest driver embedded, so you don't
+install Appium separately.
+
+### Simulator (easiest)
+
+```bash
+# boot a simulator first (or let Xcode/Simulator.app open one)
+xcrun simctl boot "iPhone 15"
+
+# .env (or flags):  PLATFORM=ios, DEVICE_NAME=<simulator name>, BUNDLE_ID=<app>
+mobile-agent run flows/signup.flow.yaml \
+  --platform ios --device "iPhone 15" --bundle-id com.example.app
+```
+
+To install an app first, set `APP_PATH=/path/to/YourApp.app` (simulator build).
+The XCUITest driver builds WebDriverAgent automatically for simulators.
+
+### Real iPhone/iPad
+
+A real device additionally needs **code signing** so WebDriverAgent can be built
+and installed on it. Connect the device (trusted, Developer Mode on) and set:
+
+```bash
+PLATFORM=ios
+DEVICE_NAME=00008110-0001....      # the device UDID (idevice_id -l / Xcode)
+BUNDLE_ID=com.example.app
+IOS_TEAM_ID=ABCDE12345             # your Apple Developer team id
+WDA_BUNDLE_ID=com.yourteam.WebDriverAgentRunner   # a bundle id your team can sign
+# IOS_SIGNING_ID=Apple Development # usually inferred
+```
+
+```bash
+mobile-agent run flows/signup.flow.yaml --platform ios --device 00008110-0001....
+```
+
+These map to the standard XCUITest capabilities (`appium:xcodeOrgId`,
+`appium:updatedWDABundleId`, `appium:wdaLocalPort`, `appium:udid`). If your
+provisioning is unusual, you can still pass any raw capability via a flow's
+`capabilities:` block. Everything else — flows, snapshot, reliable actions,
+`expect`, record/replay — works identically to Android.
+
+> Parallel iOS: each device automatically gets its own WebDriverAgent port
+> (`IOS_WDA_LOCAL_PORT + index`) in addition to its own appium-mcp port.
+
 ## Parallel device execution
 
 Run the same flow on many devices at once:

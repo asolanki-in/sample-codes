@@ -106,7 +106,7 @@ const EnvSchema = z.object({
   // WebDriverAgent local port; bumped per device in parallel iOS runs.
   IOS_WDA_LOCAL_PORT: z.coerce.number().int().positive().default(8100),
 
-  MAX_STEP_ITERATIONS: z.coerce.number().int().positive().default(14),
+  MAX_STEP_ITERATIONS: z.coerce.number().int().positive().default(20),
   // Maestro-style reliability knobs.
   SETTLE_TIMEOUT_MS: z.coerce.number().int().positive().default(7000),
   FIND_TIMEOUT_MS: z.coerce.number().int().positive().default(10000),

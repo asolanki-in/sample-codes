@@ -398,6 +398,18 @@ async function runReplayAction(
   return { ok: !res.isError, message: res.text.slice(0, 200) };
 }
 
+/**
+ * Raw appium mutations that, when called with a session-scoped element UUID,
+ * cannot be replayed. If such a call appears in a step without a replay tag, the
+ * step is not safely cacheable.
+ */
+const MUTATOR_TOOLS: ReadonlySet<string> = new Set([
+  "appium_set_value",
+  "appium_gesture",
+  "appium_drag_and_drop",
+  "appium_perform_actions",
+]);
+
 function buildReplayFlow(
   flow: Flow,
   platform: Platform,
@@ -406,15 +418,24 @@ function buildReplayFlow(
 ): ReplayFlow {
   const steps: ReplayStep[] = flow.steps.map((s, i) => {
     const r = stepResults[i];
-    const actions: ReplayAction[] = (r?.toolCalls ?? [])
+    const calls = r?.toolCalls ?? [];
+    const actions: ReplayAction[] = calls
       .map((tc) => tc.replay)
       .filter((a): a is ReplayAction => Boolean(a));
+    // A step is only replayable if EVERY mutation it performed was captured.
+    // If it used a raw, session-scoped call (e.g. set_value via element UUID for
+    // an iOS date wheel), the cache can't reproduce it — so don't mark it
+    // replayable, and it will re-run via the agent instead of replaying wrongly.
+    const hasUncapturedMutation = calls.some(
+      (tc) => MUTATOR_TOOLS.has(tc.tool) && !tc.replay,
+    );
     return {
       id: s.id,
       text: s.text,
       actions,
       ...(s.expect ? { expect: s.expect } : {}),
-      replayable: r?.status === "success" && (actions.length > 0 || Boolean(s.expect)),
+      replayable:
+        r?.status === "success" && actions.length > 0 && !hasUncapturedMutation,
     };
   });
   return {

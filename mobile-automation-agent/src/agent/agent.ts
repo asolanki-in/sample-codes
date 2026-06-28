@@ -81,6 +81,10 @@ export class MobileAgent {
     this.messages.push({ role: "user", parts });
 
     let nudged = false;
+    // Loop-breaker: count identical tool calls so a model can't spin on the same
+    // no-progress call (e.g. re-finding an ambiguous element forever).
+    const callCounts = new Map<string, number>();
+    let stuckNudged = false;
 
     for (let iteration = 1; iteration <= this.deps.maxStepIterations; iteration++) {
       this.pruneObservations();
@@ -147,6 +151,10 @@ export class MobileAgent {
           continue;
         }
 
+        // Track identical calls to detect spinning.
+        const sig = `${call.name}:${safeStringify(call.input)}`;
+        callCounts.set(sig, (callCounts.get(sig) ?? 0) + 1);
+
         if (call.name === INSPECT_SCREEN_TOOL) {
           const started = Date.now();
           const snap = (await this.captureSnapshot()) ?? "UI_SNAPSHOT (unavailable)";
@@ -168,6 +176,35 @@ export class MobileAgent {
       if (finished) {
         this.log.info(`step ${index}/${total} ${finished.status.toUpperCase()}: ${finished.summary}`);
         return finished;
+      }
+
+      // Loop-breaker: if the model keeps issuing the same call, nudge it once to
+      // change strategy; if it still won't stop, fail fast instead of burning the
+      // whole budget.
+      const maxRepeat = Math.max(0, ...callCounts.values());
+      if (maxRepeat >= 6) {
+        const [topSig] = [...callCounts.entries()].sort((a, b) => b[1] - a[1])[0] ?? [""];
+        return {
+          status: "failure",
+          summary: `Stuck repeating ${topSig.split(":")[0]} with no progress — the element is likely ambiguous or absent.`,
+          iterations: iteration,
+          toolCalls,
+        };
+      }
+      if (maxRepeat >= 3 && !stuckNudged) {
+        stuckNudged = true;
+        this.messages.push({
+          role: "user",
+          parts: [
+            {
+              type: "text",
+              text:
+                "You have repeated the same tool call several times with no progress. STOP repeating it. " +
+                "Call inspect_screen, then try a DIFFERENT approach: pick the target by `index` if several elements share a selector, " +
+                "use a relative anchor (below/above/rightOf), or tap the field directly and then input_text without `into`.",
+            },
+          ],
+        });
       }
     }
 
@@ -318,6 +355,14 @@ function isReplayableMcp(name: string, input: Record<string, unknown>): boolean 
 function prune(replacers: Array<() => void>, keep: number): void {
   const removeCount = Math.max(0, replacers.length - keep);
   for (let i = 0; i < removeCount; i++) replacers[i]?.();
+}
+
+function safeStringify(obj: unknown): string {
+  try {
+    return JSON.stringify(obj) ?? "";
+  } catch {
+    return String(obj);
+  }
 }
 
 function compact(obj: Record<string, unknown>): string {

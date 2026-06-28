@@ -137,8 +137,13 @@ export class DeviceController {
     if (!hasPrimary) {
       // Relative-only query: order by proximity to the (first) anchor.
       const anchor = anchors[0]?.el;
-      if (!anchor) return [];
-      return [...pool].sort((a, b) => distance(a, anchor) - distance(b, anchor));
+      if (anchor) {
+        return [...pool].sort((a, b) => distance(a, anchor) - distance(b, anchor));
+      }
+      // Bare `{index: N}` (no text/id/anchor): select positionally from all
+      // actionable elements, in document order, so "the Nth element" works.
+      if (query.index !== undefined) return [...pool];
+      return [];
     }
 
     const scored: Array<{ el: UiElement; score: number }> = [];
@@ -180,15 +185,19 @@ export class DeviceController {
     const fields = snapshot.elements.filter(isEditable);
     if (fields.length === 0) return undefined;
 
-    // Prefer a field directly below the label and horizontally overlapping it,
-    // with the smallest vertical gap (the field immediately under this label).
+    // Prefer a field directly below the label and horizontally overlapping it.
+    // Among those, prefer an EMPTY field (so a label resolves to the field still
+    // waiting for input, not an already-filled look-alike), then the smallest
+    // vertical gap (the field immediately under this label).
     const below = fields
       .filter((f) => isBelow(f, label) && horizontallyOverlaps(f, label))
-      .sort((a, b) => topGap(a, label) - topGap(b, label));
+      .sort((a, b) => emptyRank(a) - emptyRank(b) || topGap(a, label) - topGap(b, label));
     if (below.length > 0) return below[0];
 
-    // Otherwise the nearest editable field by center distance.
-    return [...fields].sort((a, b) => distance(a, label) - distance(b, label))[0];
+    // Otherwise the nearest editable field by center distance (empty first).
+    return [...fields].sort(
+      (a, b) => emptyRank(a) - emptyRank(b) || distance(a, label) - distance(b, label),
+    )[0];
   }
 
   /** Implicit-wait for a matching element to appear; returns it + the snapshot. */
@@ -266,49 +275,96 @@ export class DeviceController {
   }
 
   /**
-   * Enter text. When `into` is given we resolve the field and use Appium's
-   * setValue (focuses + replaces); otherwise we type into the focused element.
+   * Enter text. When `into` is given we resolve the field (handling unlabeled
+   * fields, `{index:N}`, and multiple look-alike fields by preferring the EMPTY
+   * one), type, and verify. If the chosen field doesn't take the value and there
+   * is another EMPTY candidate, we advance to it — never typing into an
+   * already-filled field, so we can't clobber a different field's data.
    */
   async inputText(args: { text: string; into?: ElementQuery; clear?: boolean }): Promise<ActionResult> {
-    let label = "the focused field";
-    let toolError = false;
-    let typedField: UiElement | undefined;
-
-    if (args.into) {
-      const found = await this.waitForMatch(args.into);
-      if (!found.element) {
-        return { ok: false, message: `No input matched ${describe(args.into)}.`, snapshot: found.text };
-      }
-      // The match may be a static label above an unlabeled field — resolve to
-      // the actual editable element.
-      const field = this.findInputFor(found.snapshot, found.element) ?? found.element;
-      typedField = field;
-      label = describe(args.into) + (field !== found.element ? " (field below the label)" : "");
-
-      const uuid = await this.resolveUuid(field);
-      if (uuid) {
-        const res = await this.mcp.callTool("appium_set_value", { elementUUID: uuid, text: args.text });
-        toolError = res.isError;
-      } else {
-        // No locator (unlabeled field): focus by tapping its center, then type.
-        if (field.c) await this.tapAt(field.c[0], field.c[1]);
-        const res = await this.mcp.callTool("appium_set_value", { text: args.text, w3cActions: true });
-        toolError = res.isError;
-      }
-    } else {
+    if (!args.into) {
       const res = await this.mcp.callTool("appium_set_value", { text: args.text, w3cActions: true });
-      toolError = res.isError;
+      const after = await this.waitForStableHierarchy();
+      if (res.isError) return this.result(false, "Failed to type into the focused field.", after, true);
+      const verdict = this.verifyInput(after, args.text, undefined);
+      return this.result(verdict.ok, `${verdict.message} (the focused field)`, after, true);
+    }
+
+    const found = await this.waitForMatch(args.into);
+    if (!found.element) {
+      return { ok: false, message: `No input matched ${describe(args.into)}.`, snapshot: found.text };
+    }
+
+    const candidates = this.inputCandidates(found.snapshot, args.into, found.element);
+    // Try the best candidate; only advance to additional candidates that are
+    // EMPTY (so a wrong-but-filled field is never overwritten).
+    const tryList = candidates.filter((c, i) => i === 0 || valueOf(c).trim() === "").slice(0, 3);
+    const label = describe(args.into);
+
+    let lastVerdict: { ok: boolean; message: string } = { ok: false, message: "No input field found" };
+    for (const field of tryList) {
+      const toolError = await this.typeInto(field, args.text);
+      const after = await this.waitForStableHierarchy();
+      if (toolError) {
+        lastVerdict = { ok: false, message: "Failed to enter text" };
+        continue;
+      }
+      const verdict = this.verifyInput(after, args.text, field);
+      lastVerdict = verdict;
+      if (verdict.ok) {
+        return this.result(true, `${verdict.message} (${label})`, after, true);
+      }
     }
 
     const after = await this.waitForStableHierarchy();
-    if (toolError) {
-      return this.result(false, `Failed to enter text into ${label}.`, after, true);
+    return this.result(lastVerdict.ok, `${lastVerdict.message} (${label})`, after, false);
+  }
+
+  /** Ordered editable candidates for an `into` selector, EMPTY fields first. */
+  private inputCandidates(
+    snapshot: UiSnapshot,
+    into: ElementQuery,
+    fallback: UiElement,
+  ): UiElement[] {
+    // Bare `{index:N}` -> the Nth editable field.
+    const onlyIndex =
+      into.index !== undefined &&
+      !into.text &&
+      !into.id &&
+      !into.accessibilityId &&
+      !into.below &&
+      !into.above &&
+      !into.leftOf &&
+      !into.rightOf;
+    if (onlyIndex) {
+      const field = snapshot.elements.filter(isEditable)[into.index!];
+      return field ? [field] : [];
     }
 
-    // VERIFY: positive confirmation when we can read the value back; never a
-    // false failure when re-locating an unlabeled field is unreliable.
-    const verdict = this.verifyInput(after, args.text, typedField);
-    return this.result(verdict.ok, `${verdict.message} (${label})`, after, true);
+    const seen = new Set<number>();
+    const cands: UiElement[] = [];
+    for (const m of this.match(snapshot, into)) {
+      const field = this.findInputFor(snapshot, m) ?? m;
+      if (isEditable(field) && !seen.has(field.ref)) {
+        seen.add(field.ref);
+        cands.push(field);
+      }
+    }
+    if (cands.length === 0) cands.push(this.findInputFor(snapshot, fallback) ?? fallback);
+    // Stable sort -> EMPTY fields first, original (match-score) order preserved.
+    return [...cands].sort((a, b) => emptyRank(a) - emptyRank(b));
+  }
+
+  /** Type into a specific field (via its locator UUID, else focus-by-tap). Returns toolError. */
+  private async typeInto(field: UiElement, text: string): Promise<boolean> {
+    const uuid = await this.resolveUuid(field);
+    if (uuid) {
+      const res = await this.mcp.callTool("appium_set_value", { elementUUID: uuid, text });
+      return res.isError;
+    }
+    if (field.c) await this.tapAt(field.c[0], field.c[1]);
+    const res = await this.mcp.callTool("appium_set_value", { text, w3cActions: true });
+    return res.isError;
   }
 
   /**
@@ -624,6 +680,11 @@ function scoreElement(el: UiElement, query: ElementQuery): number {
 /** Current value of an element: explicit value, else its (Android) text. */
 function valueOf(el: UiElement): string {
   return el.val ?? el.text ?? "";
+}
+
+/** 0 if the field is empty, 1 otherwise — used to prefer empty fields. */
+function emptyRank(el: UiElement): number {
+  return valueOf(el).trim() === "" ? 0 : 1;
 }
 
 /** Tolerant containment: compare alphanumerics only, case-insensitive. */

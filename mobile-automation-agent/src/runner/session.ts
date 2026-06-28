@@ -75,8 +75,10 @@ export async function createSession(
 
   const args: Record<string, unknown> = {
     action: "create",
-    platform: platform === "ios" ? "iOS" : "Android",
-    capabilities,
+    // appium-mcp expects a lowercase platform selector and capabilities as a
+    // JSON string (not an object).
+    platform,
+    capabilities: JSON.stringify(capabilities),
   };
   if (config.appiumMcp.remoteServerUrl) {
     args.remoteServerUrl = config.appiumMcp.remoteServerUrl;

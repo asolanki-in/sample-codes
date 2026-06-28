@@ -13,7 +13,7 @@ import { readFile } from "node:fs/promises";
 import { basename, extname } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import type { Flow, FlowStep, ReplayFlow } from "../types.js";
+import type { Expectation, Flow, FlowStep, ReplayFlow, StepSelector } from "../types.js";
 
 const SelectorSchema = z.union([
   z.string(),
@@ -182,6 +182,43 @@ export async function loadReplayFlow(path: string): Promise<ReplayFlow> {
     recordedAt: r.recordedAt ?? new Date().toISOString(),
     model: r.model ?? "unknown",
     steps: r.steps,
+  };
+}
+
+/**
+ * Substitute `{{var}}` placeholders in a flow's step text and assertions with
+ * per-run values. Enables one flow template to drive many runs with different
+ * data (data-driven / parallel). Unknown placeholders are left untouched.
+ */
+export function substituteVars(flow: Flow, vars: Record<string, string>): Flow {
+  if (Object.keys(vars).length === 0) return flow;
+  const sub = (s: string): string =>
+    s.replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (m, key) => (key in vars ? vars[key]! : m));
+
+  const subSelector = (sel: StepSelector): StepSelector => {
+    if (typeof sel === "string") return sub(sel);
+    return {
+      ...(sel.text !== undefined ? { text: sub(sel.text) } : {}),
+      ...(sel.id !== undefined ? { id: sub(sel.id) } : {}),
+      ...(sel.accessibilityId !== undefined ? { accessibilityId: sub(sel.accessibilityId) } : {}),
+    };
+  };
+  const subExpect = (e: Expectation): Expectation => {
+    const each = (v: StepSelector | StepSelector[]) =>
+      Array.isArray(v) ? v.map(subSelector) : subSelector(v);
+    return {
+      ...(e.visible !== undefined ? { visible: each(e.visible) } : {}),
+      ...(e.notVisible !== undefined ? { notVisible: each(e.notVisible) } : {}),
+    };
+  };
+
+  return {
+    ...flow,
+    steps: flow.steps.map((s) => ({
+      ...s,
+      text: sub(s.text),
+      ...(s.expect ? { expect: subExpect(s.expect) } : {}),
+    })),
   };
 }
 

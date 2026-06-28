@@ -56,6 +56,15 @@ export function printReport(report: FlowReport, logger: Logger): void {
       (report.skipped ? `, ${report.skipped} skipped` : "") +
       `  in ${ms(report.durationMs)}`,
   );
+  const m = report.metrics;
+  lines.push(
+    paint(
+      DIM,
+      `element-finding ${pct(m.elementLookups.successRate)} (${m.elementLookups.found}/${m.elementLookups.attempts}), ` +
+        `verify ${pct(m.verifications.passRate)} (${m.verifications.passed}/${m.verifications.attempts}), ` +
+        `cache hits ${m.cacheHits}/${m.steps.total}`,
+    ),
+  );
   lines.push("");
   logger.info(lines.join("\n"));
 }
@@ -69,4 +78,8 @@ export async function writeReport(report: FlowReport, path: string): Promise<voi
 function ms(value: number): string {
   if (value < 1000) return `${value}ms`;
   return `${(value / 1000).toFixed(1)}s`;
+}
+
+function pct(rate: number): string {
+  return `${Math.round(rate * 100)}%`;
 }

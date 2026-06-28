@@ -13,10 +13,14 @@ import { buildToolDefs } from "../llm/toolAdapter.js";
 import { createProvider } from "../llm/provider.js";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { randomUUID } from "node:crypto";
 import { MobileAgent } from "../agent/agent.js";
 import { DeviceController, dispatchAction, type ElementQuery } from "../agent/device.js";
 import { buildSystemPrompt } from "../agent/prompts.js";
+import { RunEmitter } from "../events.js";
 import { createSession, deleteSession } from "./session.js";
+import { substituteVars } from "./flowParser.js";
+import { analyzeFailure, computeMetrics } from "./metrics.js";
 import type {
   Expectation,
   Flow,
@@ -43,6 +47,16 @@ export interface RunFlowOptions {
    * and the cache is updated. The (refreshed) cache is written back here.
    */
   cachePath?: string;
+  /** Stable id for this run (auto-generated if omitted). */
+  runId?: string;
+  /** Event stream for live run/step/action telemetry. */
+  emitter?: RunEmitter;
+  /** Per-run variable substitution for `{{var}}` placeholders in the flow. */
+  vars?: Record<string, string>;
+  /** Embed base64 step screenshots in the returned report (for in-memory hosts). */
+  inlineScreenshots?: boolean;
+  /** Capture a screenshot at the end of each step (default: true when an emitter or artifactsDir is set). */
+  captureStepScreenshots?: boolean;
 }
 
 export async function runFlow(
@@ -53,6 +67,12 @@ export async function runFlow(
 ): Promise<FlowReport> {
   const stopOnFailure = options.stopOnFailure ?? true;
   const startedAt = new Date();
+  const runId = options.runId ?? randomUUID();
+  const emitter = options.emitter;
+  if (options.vars) flow = substituteVars(flow, options.vars);
+  const captureShots =
+    options.captureStepScreenshots ??
+    Boolean(emitter || options.artifactsDir || options.inlineScreenshots);
 
   const mcp = new AppiumMcpClient({
     transport: config.appiumMcp.transport,
@@ -102,9 +122,20 @@ export async function runFlow(
       maxStepIterations: config.agent.maxStepIterations,
       visionEnabled: config.agent.visionEnabled,
       logger,
+      emitter,
+      runId,
     });
 
     const total = flow.steps.length;
+    const deviceName = flow.device ?? config.device.deviceName;
+    emitter?.emitEvent("run:start", {
+      runId,
+      flow: flow.name,
+      device: { platform, deviceName },
+      totalSteps: total,
+      startedAt: startedAt.toISOString(),
+      ...(options.vars ? { vars: options.vars } : {}),
+    });
     let aborted = false;
 
     // Self-healing cache: actions learned on a previous run, keyed by step text.
@@ -115,27 +146,32 @@ export async function runFlow(
       const index = i + 1;
 
       if (aborted) {
-        stepResults.push(skipped(step.id, step.text));
+        const sr = skipped(step.id, step.text);
+        stepResults.push(sr);
+        emitter?.emitEvent("step:end", stepEndEvent(runId, index, total, sr));
         continue;
       }
 
       logger.info(`▶ Step ${index}/${total}: ${step.text}`);
+      emitter?.emitEvent("step:start", { runId, stepId: step.id, index, total, text: step.text });
 
       // FAST PATH: try the cached actions first (no LLM). On any failure, fall
       // through to the agent so it re-resolves and the cache self-heals.
       const cached = cache.get(step.text);
       let result: StepRunResult | null = null;
+      let fromCache = false;
       if (cached && cached.length > 0) {
         const replayed = await tryCachedStep(device, mcp, cached, logger);
         if (replayed.ok) {
           result = syntheticOutcome(cached, replayed.durationMs, "cache");
+          fromCache = true;
           logger.info(`  ✓ cache hit (${cached.length} action(s), no LLM)`);
         } else {
           logger.info(`  cache stale (${replayed.message}); re-resolving with the agent`);
         }
       }
       if (!result) {
-        result = await runStepWithRetries(agent, step.text, index, total, step.retries);
+        result = await runStepWithRetries(agent, step.text, index, total, step.retries, step.id);
       }
 
       const stepResult: StepResult = {
@@ -150,6 +186,7 @@ export async function runFlow(
         durationMs: result.durationMs,
         startedAt: result.startedAt,
         finishedAt: result.finishedAt,
+        cached: fromCache,
       };
       // VERIFY: if the author declared post-conditions, check them
       // deterministically — this overrides the agent's own self-report.
@@ -164,11 +201,30 @@ export async function runFlow(
         }
       }
 
-      stepResults.push(stepResult);
-
-      if (options.artifactsDir) {
-        await saveScreenshot(mcp, options.artifactsDir, `step-${index}-${stepResult.status}.png`, logger);
+      if (stepResult.status === "failure") {
+        stepResult.analysis = analyzeFailure(stepResult);
       }
+
+      // Evidence: capture an end-of-step screenshot for events / report / disk.
+      if (captureShots) {
+        const png = await captureScreenshot(mcp, logger);
+        if (png) {
+          if (options.inlineScreenshots) stepResult.screenshot = png;
+          if (options.artifactsDir) {
+            const path = `${options.artifactsDir}/step-${index}-${stepResult.status}.png`;
+            await mkdir(options.artifactsDir, { recursive: true });
+            await writeFile(path, Buffer.from(png, "base64"));
+            stepResult.screenshotPath = path;
+          }
+          emitter?.emitEvent("step:end", { ...stepEndEvent(runId, index, total, stepResult), screenshot: png });
+        } else {
+          emitter?.emitEvent("step:end", stepEndEvent(runId, index, total, stepResult));
+        }
+      } else {
+        emitter?.emitEvent("step:end", stepEndEvent(runId, index, total, stepResult));
+      }
+
+      stepResults.push(stepResult);
 
       if (stepResult.status === "failure" && !step.optional && stopOnFailure) {
         logger.error(`Aborting flow: required step "${step.text}" failed.`);
@@ -179,13 +235,17 @@ export async function runFlow(
     if (!options.keepSession) {
       await deleteSession(mcp, logger);
     }
+  } catch (err) {
+    emitter?.emitEvent("run:error", { runId, error: (err as Error).message });
+    throw err;
   } finally {
     await mcp.close();
   }
 
   const model =
     config.llm.provider === "ollama" ? config.llm.ollama.model : config.llm.anthropic.model;
-  const report = assembleReport(flow, platform, model, startedAt, stepResults);
+  const deviceName = flow.device ?? config.device.deviceName;
+  const report = assembleReport(runId, flow, platform, deviceName, model, startedAt, stepResults);
 
   // Emit a deterministic replay recording and/or evidence artifacts.
   if (options.recordPath) {
@@ -200,7 +260,31 @@ export async function runFlow(
     await writeReplayFlow(buildReplayFlow(flow, platform, model, stepResults), `${options.artifactsDir}/replay.json`, logger);
   }
 
+  emitter?.emitEvent("run:complete", { runId, report });
   return report;
+}
+
+/** Build a StepEndEvent payload from a finished step result. */
+function stepEndEvent(
+  runId: string,
+  index: number,
+  total: number,
+  s: StepResult,
+): import("../events.js").StepEndEvent {
+  return {
+    runId,
+    stepId: s.id,
+    index,
+    total,
+    text: s.text,
+    status: s.status,
+    summary: s.summary,
+    iterations: s.iterations,
+    durationMs: s.durationMs,
+    cached: s.cached ?? false,
+    toolCalls: s.toolCalls,
+    ...(s.analysis ? { analysis: s.analysis } : {}),
+  };
 }
 
 /**
@@ -322,7 +406,15 @@ export async function runReplay(
     await mcp.close();
   }
 
-  const report = assembleReport(sessionFlow, platform, `replay:${replay.model}`, startedAt, stepResults);
+  const report = assembleReport(
+    options.runId ?? randomUUID(),
+    sessionFlow,
+    platform,
+    replay.device,
+    `replay:${replay.model}`,
+    startedAt,
+    stepResults,
+  );
   if (options.artifactsDir) await writeJson(`${options.artifactsDir}/report.json`, report);
   return report;
 }
@@ -461,22 +553,29 @@ async function writeJson(path: string, data: unknown): Promise<void> {
   await writeFile(path, JSON.stringify(data, null, 2), "utf8");
 }
 
-/** Capture a screenshot from the device and save it as PNG (best-effort). */
+/** Capture a screenshot as base64 PNG (best-effort, null on failure). */
+async function captureScreenshot(mcp: AppiumMcpClient, logger: Logger): Promise<string | null> {
+  try {
+    const res = await mcp.callTool("appium_screenshot", { maxWidth: 1080 });
+    const image = res.blocks.find((b) => b.type === "image");
+    return image && image.type === "image" ? image.data : null;
+  } catch (err) {
+    logger.debug(`screenshot capture failed: ${(err as Error).message}`);
+    return null;
+  }
+}
+
+/** Capture a screenshot and write it to disk (best-effort). */
 async function saveScreenshot(
   mcp: AppiumMcpClient,
   dir: string,
   name: string,
   logger: Logger,
 ): Promise<void> {
-  try {
-    const res = await mcp.callTool("appium_screenshot", { maxWidth: 1080 });
-    const image = res.blocks.find((b) => b.type === "image");
-    if (!image || image.type !== "image") return;
-    await mkdir(dir, { recursive: true });
-    await writeFile(`${dir}/${name}`, Buffer.from(image.data, "base64"));
-  } catch (err) {
-    logger.debug(`screenshot artifact failed: ${(err as Error).message}`);
-  }
+  const data = await captureScreenshot(mcp, logger);
+  if (!data) return;
+  await mkdir(dir, { recursive: true });
+  await writeFile(`${dir}/${name}`, Buffer.from(data, "base64"));
 }
 
 interface StepRunResult {
@@ -493,15 +592,16 @@ async function runStepWithRetries(
   index: number,
   total: number,
   retries: number,
+  stepId: string,
 ): Promise<StepRunResult> {
   const start = Date.now();
   const startedAt = new Date(start).toISOString();
-  let outcome = await agent.runStep(text, index, total);
+  let outcome = await agent.runStep(text, index, total, stepId);
   let attempts = 1;
 
   while (outcome.status === "failure" && attempts <= retries) {
     attempts += 1;
-    outcome = await agent.runStep(`Retry (attempt ${attempts}): ${text}`, index, total);
+    outcome = await agent.runStep(`Retry (attempt ${attempts}): ${text}`, index, total, stepId);
   }
 
   const end = Date.now();
@@ -579,8 +679,10 @@ function skipped(id: string, text: string): StepResult {
 }
 
 function assembleReport(
+  runId: string,
   flow: Flow,
   platform: Platform,
+  device: string | undefined,
   model: string,
   startedAt: Date,
   steps: StepResult[],
@@ -591,8 +693,10 @@ function assembleReport(
   const skippedCount = steps.filter((s) => s.status === "skipped").length;
 
   return {
+    runId,
     flow: flow.name,
     platform,
+    ...(device ? { device } : {}),
     model,
     status: failed === 0 ? "passed" : "failed",
     startedAt: startedAt.toISOString(),
@@ -603,5 +707,6 @@ function assembleReport(
     failed,
     skipped: skippedCount,
     steps,
+    metrics: computeMetrics(steps),
   };
 }

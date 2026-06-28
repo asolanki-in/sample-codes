@@ -59,6 +59,10 @@ export interface ActionResult {
   message: string;
   /** Fresh, settled snapshot text to feed back to the model. */
   snapshot: string;
+  /** For element-locating actions: whether the target element was found. */
+  located?: boolean;
+  /** For input actions: whether the typed value was verified on screen. */
+  verified?: boolean;
 }
 
 export class DeviceController {
@@ -230,12 +234,14 @@ export class DeviceController {
       const before = await this.pageSource();
       await this.tapAt(args.x, args.y);
       const after = await this.waitForStableHierarchy();
-      return this.result(true, `Tapped (${args.x}, ${args.y}).`, after, before !== after);
+      return this.result(true, `Tapped (${args.x}, ${args.y}).`, after, before !== after, {
+        located: true,
+      });
     }
 
     const found = await this.waitForMatch(args);
     if (!found.element) {
-      return { ok: false, message: `No element matched ${describe(args)}.`, snapshot: found.text };
+      return { ok: false, message: `No element matched ${describe(args)}.`, snapshot: found.text, located: false };
     }
 
     let element = found.element;
@@ -246,7 +252,7 @@ export class DeviceController {
         // No center (rare): fall back to a locator tap via find_element + UUID.
         const viaLocator = await this.tapViaLocator(element);
         const after = await this.waitForStableHierarchy();
-        return this.result(viaLocator, `Tapped ${describe(args)} via locator.`, after, true);
+        return this.result(viaLocator, `Tapped ${describe(args)} via locator.`, after, true, { located: true });
       }
 
       const before = await this.pageSource();
@@ -254,7 +260,7 @@ export class DeviceController {
       const after = await this.waitForStableHierarchy();
 
       if (before !== after) {
-        return this.result(true, `Tapped ${describe(args)} (ref ${element.ref}).`, after, true);
+        return this.result(true, `Tapped ${describe(args)} (ref ${element.ref}).`, after, true, { located: true });
       }
 
       // No change: re-locate (it may have moved) and retry.
@@ -271,6 +277,7 @@ export class DeviceController {
       `Tapped ${describe(args)} (ref ${element.ref}); no UI change detected after retries — it may be a no-op or an in-place toggle.`,
       final,
       false,
+      { located: true },
     );
   }
 
@@ -287,12 +294,14 @@ export class DeviceController {
       const after = await this.waitForStableHierarchy();
       if (res.isError) return this.result(false, "Failed to type into the focused field.", after, true);
       const verdict = this.verifyInput(after, args.text, undefined);
-      return this.result(verdict.ok, `${verdict.message} (the focused field)`, after, true);
+      return this.result(verdict.ok, `${verdict.message} (the focused field)`, after, true, {
+        verified: verdict.ok,
+      });
     }
 
     const found = await this.waitForMatch(args.into);
     if (!found.element) {
-      return { ok: false, message: `No input matched ${describe(args.into)}.`, snapshot: found.text };
+      return { ok: false, message: `No input matched ${describe(args.into)}.`, snapshot: found.text, located: false };
     }
 
     const candidates = this.inputCandidates(found.snapshot, args.into, found.element);
@@ -312,12 +321,18 @@ export class DeviceController {
       const verdict = this.verifyInput(after, args.text, field);
       lastVerdict = verdict;
       if (verdict.ok) {
-        return this.result(true, `${verdict.message} (${label})`, after, true);
+        return this.result(true, `${verdict.message} (${label})`, after, true, {
+          located: true,
+          verified: true,
+        });
       }
     }
 
     const after = await this.waitForStableHierarchy();
-    return this.result(lastVerdict.ok, `${lastVerdict.message} (${label})`, after, false);
+    return this.result(lastVerdict.ok, `${lastVerdict.message} (${label})`, after, false, {
+      located: tryList.length > 0,
+      verified: lastVerdict.ok,
+    });
   }
 
   /** Ordered editable candidates for an `into` selector, EMPTY fields first. */
@@ -423,9 +438,9 @@ export class DeviceController {
   async assertVisible(query: ElementQuery, timeoutMs?: number): Promise<ActionResult> {
     const found = await this.waitForMatch(query, timeoutMs ?? this.opts.findTimeoutMs);
     if (found.element) {
-      return { ok: true, message: `Visible: ${describe(query)} (ref ${found.element.ref}).`, snapshot: found.text };
+      return { ok: true, message: `Visible: ${describe(query)} (ref ${found.element.ref}).`, snapshot: found.text, located: true };
     }
-    return { ok: false, message: `Not visible within timeout: ${describe(query)}.`, snapshot: found.text };
+    return { ok: false, message: `Not visible within timeout: ${describe(query)}.`, snapshot: found.text, located: false };
   }
 
   /** Scroll in a direction until the element appears (delegates to appium scroll_to_element). */
@@ -455,8 +470,8 @@ export class DeviceController {
     }
     const found = await this.waitForMatch(query, 2000);
     return found.element
-      ? { ok: true, message: `Scrolled to ${describe(query)}.`, snapshot: found.text }
-      : { ok: false, message: `Could not reveal ${describe(query)} by scrolling.`, snapshot: found.text };
+      ? { ok: true, message: `Scrolled to ${describe(query)}.`, snapshot: found.text, located: true }
+      : { ok: false, message: `Could not reveal ${describe(query)} by scrolling.`, snapshot: found.text, located: false };
   }
 
   /** State-aware toggle: only taps when the current state differs from desired. */
@@ -466,13 +481,13 @@ export class DeviceController {
     const el =
       found.element ?? found.snapshot.elements.find((e) => e.state?.includes("checkable"));
     if (!el) {
-      return { ok: false, message: `No toggle matched "${args.text}".`, snapshot: found.text };
+      return { ok: false, message: `No toggle matched "${args.text}".`, snapshot: found.text, located: false };
     }
     const isOn = el.state?.includes("checked") ?? false;
     const desired = args.to === "on" ? true : args.to === "off" ? false : !isOn;
 
     if (isOn === desired) {
-      return { ok: true, message: `Toggle "${args.text}" already ${desired ? "on" : "off"}.`, snapshot: found.text };
+      return { ok: true, message: `Toggle "${args.text}" already ${desired ? "on" : "off"}.`, snapshot: found.text, located: true };
     }
     if (el.c) await this.tapAt(el.c[0], el.c[1]);
     const after = await this.waitForStableHierarchy();
@@ -483,6 +498,7 @@ export class DeviceController {
       `Toggled "${args.text}" → ${desired ? "on" : "off"} (now ${nowOn ? "on" : "off"}).`,
       after,
       true,
+      { located: true },
     );
   }
 
@@ -536,10 +552,16 @@ export class DeviceController {
     return undefined;
   }
 
-  private result(ok: boolean, message: string, xml: string, changed: boolean): ActionResult {
+  private result(
+    ok: boolean,
+    message: string,
+    xml: string,
+    changed: boolean,
+    extra?: { located?: boolean; verified?: boolean },
+  ): ActionResult {
     const snapshot = renderSnapshot(buildSnapshot(xml, this.opts.platform));
     const note = changed ? "" : " (no UI change)";
-    return { ok, message: message + note, snapshot };
+    return { ok, message: message + note, snapshot, ...extra };
   }
 }
 

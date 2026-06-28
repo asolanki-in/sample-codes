@@ -322,6 +322,62 @@ turning a multi-minute run into seconds while keeping the same reliability
 (`step-<n>-<status>.png`) plus the JSON `report.json` and a `replay.json`, so a
 failed run leaves something an engineer can actually inspect.
 
+## Embedding as a package (events + report)
+
+The orchestrator is event-driven so it can be embedded in a larger app. You pass
+`runId`, the flow, device/vars; you get a live event stream plus a final report
+with **status, per-step screenshots, failure analysis and metrics**.
+
+```ts
+import { runFlow, RunEmitter, loadConfig, createLogger } from "mobile-automation-agent";
+
+const emitter = new RunEmitter();
+emitter.onEvent("run:start",  (e) => host.startRun(e.runId, e.device, e.totalSteps));
+emitter.onEvent("step:start", (e) => host.markRunning(e.stepId, e.text));
+emitter.onEvent("action",     (e) => host.telemetry(e));            // tool, ok, located, verified
+emitter.onEvent("step:end",   (e) => host.recordStep(e));           // status + screenshot(base64) + analysis
+emitter.onEvent("run:complete", (e) => host.finish(e.report));      // pass/fail + metrics
+emitter.onEvent("run:error",  (e) => host.error(e.error));
+
+const report = await runFlow(flow, loadConfig(), createLogger("info"), {
+  runId, emitter, vars: { username: "alice" }, inlineScreenshots: true,
+});
+```
+
+Events (`src/events.ts`): `run:start`, `step:start`, `action`, `step:end`
+(carries `status` = success/failure/skipped, a base64 `screenshot`, and on
+failure an `analysis`), `run:complete`, `run:error`. The returned `FlowReport`
+contains every `StepResult` (status, summary, `analysis`, `screenshotPath` or
+inline `screenshot`) plus run `metrics`.
+
+## Measuring success across runs
+
+Every report includes a `metrics` block designed to be **summed across many
+runs**:
+
+```jsonc
+"metrics": {
+  "steps":          { "total": 9, "passed": 9, "failed": 0, "skipped": 0 },
+  "actions":        { "total": 12, "ok": 12 },
+  "elementLookups": { "attempts": 10, "found": 9, "successRate": 0.9 }, // <-- find rate
+  "verifications":  { "attempts": 3, "passed": 3, "passRate": 1 },
+  "cacheHits":      7
+}
+```
+
+To get the **element-finding success rate over 100–200 runs**, collect each run's
+report (or the `action` events) and aggregate:
+
+```
+elementFindingSuccessRate = Σ elementLookups.found / Σ elementLookups.attempts
+```
+
+`elementLookups` counts every action that had to *locate* an element
+(`tap`, `input_text`, `assert_visible`, `scroll_until_visible`, `toggle`) and
+whether it found its target — so the rate is comparable across devices and apps.
+Pair it with `verifications.passRate` (did typed values land), step pass rate,
+and `cacheHits` (how much ran without the LLM) for a full health dashboard.
+
 ## How actions are verified
 
 The agent is **not** trusted blindly. Verification happens at three layers:

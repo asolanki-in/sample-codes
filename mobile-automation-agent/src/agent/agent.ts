@@ -29,6 +29,7 @@ import type {
   ToolMessage,
 } from "../llm/types.js";
 import { dispatchAction, type DeviceController } from "./device.js";
+import type { RunEmitter } from "../events.js";
 import { STEP_COMPLETE_TOOL, buildStepInstruction } from "./prompts.js";
 
 /** How many recent screenshots to retain in history. */
@@ -45,6 +46,9 @@ export interface AgentDeps {
   maxStepIterations: number;
   visionEnabled: boolean;
   logger: Logger;
+  /** Optional event stream for fine-grained action telemetry. */
+  emitter?: RunEmitter;
+  runId?: string;
 }
 
 export interface RunStepOutcome {
@@ -59,6 +63,7 @@ export class MobileAgent {
   private readonly messages: ChatMessage[] = [];
   private readonly log: Logger;
   private readonly useVision: boolean;
+  private currentStepId = "";
 
   constructor(private readonly deps: AgentDeps) {
     this.log = deps.logger.child("agent");
@@ -66,7 +71,13 @@ export class MobileAgent {
   }
 
   /** Drive the model until the given step is finished. */
-  async runStep(stepText: string, index: number, total: number): Promise<RunStepOutcome> {
+  async runStep(
+    stepText: string,
+    index: number,
+    total: number,
+    stepId?: string,
+  ): Promise<RunStepOutcome> {
+    this.currentStepId = stepId ?? `step-${index}`;
     const toolCalls: ToolCallRecord[] = [];
 
     // OBSERVE: seed the step with a fresh settled snapshot (+ screenshot when
@@ -239,6 +250,7 @@ export class MobileAgent {
         ? { replay: { kind: "mcp" as const, tool: call.name, input: call.input } }
         : {}),
     };
+    this.emitAction(record);
     return { record, parts: toToolResultParts(result), isError: result.isError };
   }
 
@@ -258,12 +270,29 @@ export class MobileAgent {
       input: call.input,
       ok: result.ok,
       durationMs,
+      ...(result.located !== undefined ? { located: result.located } : {}),
+      ...(result.verified !== undefined ? { verified: result.verified } : {}),
       ...(result.ok ? {} : { error: result.message }),
       // Reliable actions are always deterministically replayable.
       ...(result.ok ? { replay: { kind: "reliable" as const, tool: call.name, input: call.input } } : {}),
     };
+    this.emitAction(record);
     const text = `${result.ok ? "OK" : "FAILED"}: ${result.message}\n${result.snapshot}`;
     return { record, parts: [{ type: "text", text }], isError: !result.ok };
+  }
+
+  /** Emit a fine-grained action telemetry event, if an emitter is attached. */
+  private emitAction(record: ToolCallRecord): void {
+    if (!this.deps.emitter || !this.deps.runId) return;
+    this.deps.emitter.emitEvent("action", {
+      runId: this.deps.runId,
+      stepId: this.currentStepId,
+      tool: record.tool,
+      ok: record.ok,
+      durationMs: record.durationMs,
+      located: record.located,
+      verified: record.verified,
+    });
   }
 
   /** Dispatch a reliable-action tool name to the DeviceController. */

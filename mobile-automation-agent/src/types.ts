@@ -64,8 +64,47 @@ export interface ToolCallRecord {
   ok: boolean;
   durationMs: number;
   error?: string;
+  /** For actions that locate an element: whether the target was found. */
+  located?: boolean;
+  /** For input actions: whether the typed value was verified on screen. */
+  verified?: boolean;
   /** Present when this call can be replayed deterministically without an LLM. */
   replay?: ReplayAction;
+}
+
+export interface DeviceInfo {
+  platform: Platform;
+  deviceName?: string;
+}
+
+/** Structured diagnosis attached to a failed step. */
+export interface FailureAnalysis {
+  category:
+    | "element-not-found"
+    | "verification-failed"
+    | "stuck-repeating"
+    | "budget-exceeded"
+    | "assertion-failed"
+    | "tool-error"
+    | "agent-stopped"
+    | "unknown";
+  message: string;
+  /** The last tool/action involved in the failure, if any. */
+  lastTool?: string;
+  /** A short, actionable suggestion. */
+  hint?: string;
+}
+
+/** Aggregate run metrics — designed to be summed across many runs. */
+export interface RunMetrics {
+  steps: { total: number; passed: number; failed: number; skipped: number };
+  actions: { total: number; ok: number };
+  /** Element-finding: attempts = actions that needed to locate an element. */
+  elementLookups: { attempts: number; found: number; successRate: number };
+  /** Input value verification. */
+  verifications: { attempts: number; passed: number; passRate: number };
+  /** Steps served from the self-healing cache (no LLM). */
+  cacheHits: number;
 }
 
 /** A single deterministic action that can be re-executed during replay. */
@@ -110,11 +149,21 @@ export interface StepResult {
   durationMs: number;
   startedAt: string;
   finishedAt: string;
+  /** Diagnosis when status is "failure". */
+  analysis?: FailureAnalysis;
+  /** Path to the per-step screenshot, when written to disk. */
+  screenshotPath?: string;
+  /** Base64 PNG of the step's end state, when inline screenshots are requested. */
+  screenshot?: string;
+  /** True when the step was served from the cache without the LLM. */
+  cached?: boolean;
 }
 
 export interface FlowReport {
+  runId: string;
   flow: string;
   platform: Platform;
+  device?: string;
   model: string;
   status: "passed" | "failed";
   startedAt: string;
@@ -125,4 +174,5 @@ export interface FlowReport {
   failed: number;
   skipped: number;
   steps: StepResult[];
+  metrics: RunMetrics;
 }

@@ -11,7 +11,7 @@ import type { Logger } from "../logger.js";
 import { AppiumMcpClient } from "../mcp/appiumClient.js";
 import { buildToolDefs } from "../llm/toolAdapter.js";
 import { createProvider } from "../llm/provider.js";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { MobileAgent } from "../agent/agent.js";
 import { DeviceController, dispatchAction, type ElementQuery } from "../agent/device.js";
@@ -37,6 +37,12 @@ export interface RunFlowOptions {
   recordPath?: string;
   /** Directory to write per-step screenshots + the report (evidence). */
   artifactsDir?: string;
+  /**
+   * Self-healing locator cache. If the file exists, each step's cached actions
+   * are replayed first (fast, no LLM); on failure the agent re-resolves the step
+   * and the cache is updated. The (refreshed) cache is written back here.
+   */
+  cachePath?: string;
 }
 
 export async function runFlow(
@@ -101,6 +107,9 @@ export async function runFlow(
     const total = flow.steps.length;
     let aborted = false;
 
+    // Self-healing cache: actions learned on a previous run, keyed by step text.
+    const cache = options.cachePath ? await loadCache(options.cachePath, logger) : new Map();
+
     for (let i = 0; i < total; i++) {
       const step = flow.steps[i]!;
       const index = i + 1;
@@ -111,7 +120,24 @@ export async function runFlow(
       }
 
       logger.info(`▶ Step ${index}/${total}: ${step.text}`);
-      const result = await runStepWithRetries(agent, step.text, index, total, step.retries);
+
+      // FAST PATH: try the cached actions first (no LLM). On any failure, fall
+      // through to the agent so it re-resolves and the cache self-heals.
+      const cached = cache.get(step.text);
+      let result: StepRunResult | null = null;
+      if (cached && cached.length > 0) {
+        const replayed = await tryCachedStep(device, mcp, cached, logger);
+        if (replayed.ok) {
+          result = syntheticOutcome(cached, replayed.durationMs, "cache");
+          logger.info(`  ✓ cache hit (${cached.length} action(s), no LLM)`);
+        } else {
+          logger.info(`  cache stale (${replayed.message}); re-resolving with the agent`);
+        }
+      }
+      if (!result) {
+        result = await runStepWithRetries(agent, step.text, index, total, step.retries);
+      }
+
       const stepResult: StepResult = {
         id: step.id,
         text: step.text,
@@ -164,6 +190,10 @@ export async function runFlow(
   // Emit a deterministic replay recording and/or evidence artifacts.
   if (options.recordPath) {
     await writeReplayFlow(buildReplayFlow(flow, platform, model, stepResults), options.recordPath, logger);
+  }
+  // Persist the (refreshed) self-healing cache.
+  if (options.cachePath) {
+    await writeReplayFlow(buildReplayFlow(flow, platform, model, stepResults), options.cachePath, logger);
   }
   if (options.artifactsDir) {
     await writeJson(`${options.artifactsDir}/report.json`, report);
@@ -295,6 +325,63 @@ export async function runReplay(
   const report = assembleReport(sessionFlow, platform, `replay:${replay.model}`, startedAt, stepResults);
   if (options.artifactsDir) await writeJson(`${options.artifactsDir}/report.json`, report);
   return report;
+}
+
+/** Load a self-healing cache file (a replay recording) into a step-text -> actions map. */
+async function loadCache(path: string, logger: Logger): Promise<Map<string, ReplayAction[]>> {
+  const map = new Map<string, ReplayAction[]>();
+  try {
+    const content = await readFile(path, "utf8");
+    const replay = JSON.parse(content) as ReplayFlow;
+    for (const s of replay.steps ?? []) {
+      if (s.replayable && s.actions?.length) map.set(s.text, s.actions);
+    }
+    logger.info(`Loaded locator cache: ${map.size} step(s) from ${path}`);
+  } catch {
+    logger.info(`No usable cache at ${path} yet — will create it from this run.`);
+  }
+  return map;
+}
+
+/** Replay a step's cached actions deterministically (anti-cascade on failure). */
+async function tryCachedStep(
+  device: DeviceController,
+  mcp: AppiumMcpClient,
+  actions: ReplayAction[],
+  logger: Logger,
+): Promise<{ ok: boolean; message: string; durationMs: number }> {
+  const start = Date.now();
+  for (const action of actions) {
+    const res = await runReplayAction(device, mcp, action);
+    if (!res.ok) {
+      return { ok: false, message: `${action.tool} → ${res.message}`, durationMs: Date.now() - start };
+    }
+  }
+  void logger;
+  return { ok: true, message: "ok", durationMs: Date.now() - start };
+}
+
+/** Wrap cached-replay actions as a successful step outcome (so they re-cache + report). */
+function syntheticOutcome(actions: ReplayAction[], durationMs: number, via: string): StepRunResult {
+  const now = new Date().toISOString();
+  return {
+    outcome: {
+      status: "success",
+      summary: `Replayed ${actions.length} cached action(s) [${via}]`,
+      iterations: 0,
+      toolCalls: actions.map((a) => ({
+        tool: a.tool,
+        input: a.input,
+        ok: true,
+        durationMs: 0,
+        replay: a,
+      })),
+    },
+    attempts: 1,
+    durationMs,
+    startedAt: now,
+    finishedAt: now,
+  };
 }
 
 /** Execute a single recorded action during replay. */

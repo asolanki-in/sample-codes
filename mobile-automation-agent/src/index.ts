@@ -29,6 +29,7 @@ interface RunOptions {
   maxIterations?: string;
   report?: string;
   record?: string;
+  cache?: string;
   artifacts?: string;
   vision: boolean;
   keepSession?: boolean;
@@ -86,6 +87,7 @@ program
   .option("--max-iterations <n>", "max model<->device round trips per step")
   .option("-r, --report <path>", "write a JSON report to this path")
   .option("--record <path>", "record a deterministic replay file of this run")
+  .option("--cache <path>", "self-healing locator cache: replay cached steps (no LLM), heal misses, update the file")
   .option("--artifacts <dir>", "write per-step screenshots + report to this directory")
   .option("--no-vision", "disable sending screenshots to the model")
   .option("--keep-session", "do not delete the Appium session after the run")
@@ -175,6 +177,7 @@ async function runCommand(flowFile: string | undefined, options: RunOptions): Pr
       keepSession: options.keepSession,
       stopOnFailure: !options.continueOnFailure,
       recordPath: options.record,
+      cachePath: options.cache,
       artifactsDir: options.artifacts,
     });
 

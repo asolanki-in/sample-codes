@@ -297,6 +297,25 @@ mobile-agent replay signup.replay.json --report runs/ci.json
 - This is the "AI authors, deterministic engine runs" model that Maestro,
   agent-device and finalrun converge on — fast, free, and stable in CI.
 
+## Self-healing locator cache (fast + cheap re-runs)
+
+`--cache <file>` makes repeat runs fast and low-token by remembering the
+resolved actions per step and **replaying them first, with no LLM**:
+
+```bash
+# 1st run: agent resolves everything and writes the cache
+mobile-agent run flows/signup.flow.yaml --cache .cache/signup.json
+# next runs: cached steps replay instantly (no model calls); only drifted
+# steps fall back to the agent, and the cache is refreshed in place
+mobile-agent run flows/signup.flow.yaml --cache .cache/signup.json
+```
+
+Per step: if a cached action set exists it's replayed (settle + verify, no
+tokens); if it **fails** (UI changed), the agent re-resolves that step and the
+cache self-heals. So you pay the LLM only for what actually changed — typically
+turning a multi-minute run into seconds while keeping the same reliability
+(every cached action still settles, verifies, and honours `expect`).
+
 ## Evidence / artifacts
 
 `--artifacts <dir>` writes, for every step, a screenshot

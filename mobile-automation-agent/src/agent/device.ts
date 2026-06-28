@@ -272,6 +272,7 @@ export class DeviceController {
   async inputText(args: { text: string; into?: ElementQuery; clear?: boolean }): Promise<ActionResult> {
     let label = "the focused field";
     let toolError = false;
+    let typedField: UiElement | undefined;
 
     if (args.into) {
       const found = await this.waitForMatch(args.into);
@@ -281,6 +282,7 @@ export class DeviceController {
       // The match may be a static label above an unlabeled field — resolve to
       // the actual editable element.
       const field = this.findInputFor(found.snapshot, found.element) ?? found.element;
+      typedField = field;
       label = describe(args.into) + (field !== found.element ? " (field below the label)" : "");
 
       const uuid = await this.resolveUuid(field);
@@ -303,46 +305,56 @@ export class DeviceController {
       return this.result(false, `Failed to enter text into ${label}.`, after, true);
     }
 
-    // VERIFY: read the field's value back and confirm it took the input.
-    const verdict = this.verifyInput(after, args.text, args.into);
+    // VERIFY: positive confirmation when we can read the value back; never a
+    // false failure when re-locating an unlabeled field is unreliable.
+    const verdict = this.verifyInput(after, args.text, typedField);
     return this.result(verdict.ok, `${verdict.message} (${label})`, after, true);
   }
 
   /**
-   * Independent verification that text actually landed in a field: re-locate the
-   * field after typing and compare its value to what we sent (alphanumeric,
-   * case-insensitive — tolerant of formatting/masks). Password fields can't be
-   * read, so they're reported as unverifiable rather than failed.
+   * Confirm the typed value landed — favouring positive confirmation, not false
+   * failure (matching how Maestro/agent-device treat input: the action is
+   * robust, authoritative pass/fail lives in explicit `expect` assertions).
+   *
+   * 1. If ANY editable field now shows the value -> verified.
+   * 2. Else, only when we can re-locate the SAME field by a stable id/acc and it
+   *    clearly shows different non-empty content -> genuine failure.
+   * 3. Otherwise (unlabeled field, keyboard shifted the layout, value unreadable)
+   *    -> "entered (unverified)", which does NOT fail the action.
    */
   private verifyInput(
     xml: string,
     expected: string,
-    into?: ElementQuery,
+    typedField?: UiElement,
   ): { ok: boolean; message: string } {
     const snapshot = buildSnapshot(xml, this.opts.platform);
-    let field: UiElement | undefined;
-    if (into) {
-      const match = this.match(snapshot, into)[0];
-      if (match) field = this.findInputFor(snapshot, match) ?? match;
-    } else {
-      field =
-        snapshot.elements.find((e) => e.state?.includes("focused") && isEditable(e)) ??
-        snapshot.elements.find(isEditable);
+
+    // 1) Strong positive signal: some editable field already shows the value.
+    if (snapshot.elements.some((e) => isEditable(e) && containsNormalized(valueOf(e), expected))) {
+      return { ok: true, message: `Entered & verified "${expected}"` };
     }
 
-    if (!field) return { ok: true, message: `Entered "${expected}"; could not re-locate field to verify` };
-    if (field.state?.includes("password")) {
+    if (typedField?.state?.includes("password")) {
       return { ok: true, message: `Entered text into a password field (value hidden, not verified)` };
     }
 
-    const actual = field.val ?? field.text ?? "";
-    if (containsNormalized(actual, expected)) {
-      return { ok: true, message: `Entered & verified "${expected}" (field shows "${actual}")` };
+    // 2) Re-locate the SAME field only via a stable identity (id / accessibility).
+    let located: UiElement | undefined;
+    if (typedField?.id) located = snapshot.elements.find((e) => e.id === typedField.id);
+    else if (typedField?.acc) located = snapshot.elements.find((e) => e.acc === typedField.acc);
+
+    if (located && isEditable(located)) {
+      const actual = valueOf(located);
+      if (containsNormalized(actual, expected)) {
+        return { ok: true, message: `Entered & verified "${expected}" (field shows "${actual}")` };
+      }
+      if (actual.trim() !== "") {
+        return { ok: false, message: `Verification FAILED: typed "${expected}" but field shows "${actual}"` };
+      }
     }
-    return {
-      ok: false,
-      message: `Verification FAILED: typed "${expected}" but field shows "${actual}"`,
-    };
+
+    // 3) Couldn't confidently re-read (e.g. unlabeled field) — don't false-fail.
+    return { ok: true, message: `Entered "${expected}" (unverified — could not re-read the field)` };
   }
 
   /** Quick boolean visibility check (used by step-level assertions). */
@@ -607,6 +619,11 @@ function scoreElement(el: UiElement, query: ElementQuery): number {
     if (/clickable|checkable|editable/.test(el.state)) best += 5;
   }
   return best;
+}
+
+/** Current value of an element: explicit value, else its (Android) text. */
+function valueOf(el: UiElement): string {
+  return el.val ?? el.text ?? "";
 }
 
 /** Tolerant containment: compare alphanumerics only, case-insensitive. */

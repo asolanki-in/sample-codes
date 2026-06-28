@@ -184,6 +184,46 @@ The agent connects to appium-mcp over **streamable HTTP** by default.
 - **stdio fallback:** set `MCP_TRANSPORT=stdio` to spawn appium-mcp and speak
   over its stdio instead.
 
+## Parallel device execution
+
+Run the same flow on many devices at once:
+
+```bash
+mobile-agent parallel flows/signup.flow.yaml \
+  --device emulator-5554 --device emulator-5556 --device emulator-5558 \
+  --concurrency 3 \
+  --report-dir runs/reports --artifacts-dir runs/artifacts
+```
+
+Each device gets a **fully isolated** run: its own appium-mcp process on its own
+port (`MCP_HTTP_PORT + index`), its own session pinned by `udid`, its own
+`DeviceController` and LLM provider. `--concurrency` caps how many run at once;
+the process exits non-zero if any device fails.
+
+**How much can it handle?** There's no hard limit in this code — runs are
+async/I/O-bound, so a single Node process can drive many concurrently. The real
+ceilings are external:
+
+1. **Devices/emulators** — the host's RAM/CPU (an Android emulator wants ~2 GB +
+   a core, and KVM). This is usually the binding constraint locally; device
+   farms scale to dozens.
+2. **LLM rate limits** — every device is an independent agent loop making many
+   model calls. At high fan-out the provider's rate/concurrency limit, not the
+   devices, becomes the bottleneck. Use `--concurrency` to stay under it.
+3. **adb/host throughput** — many simultaneous sessions add ADB and CPU load.
+
+Rule of thumb: a beefy CI host comfortably runs ~4–8 emulators; **replay** mode
+(no LLM) parallelizes far wider since limit #2 disappears — which is the cheap
+way to fan out in CI:
+
+```bash
+mobile-agent parallel flows/signup.flow.yaml --device d1 --device d2 ... # author once
+# then replay per device with no LLM (script around `replay`, or run replays in parallel)
+```
+
+> Note: parallel autostart allocates ports per device. If you attach to existing
+> appium-mcp servers (`MCP_AUTOSTART=false`), give each its own server/port.
+
 ## Record once (AI), replay forever (deterministic)
 
 The agent is great for *authoring* a flow, but you don't want to pay an LLM — or
@@ -348,6 +388,7 @@ src/
     prompts.ts          system prompt + interaction playbooks
   runner/
     flowRunner.ts       orchestration: AI run + record, and deterministic replay
+    parallelRunner.ts   multi-device concurrency (isolated config per device)
     session.ts          deterministic capabilities + session lifecycle
     flowParser.ts       YAML/JSON/text/inline flow + replay-file loading
     report.ts           console summary + JSON report

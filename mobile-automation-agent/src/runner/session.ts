@@ -30,7 +30,12 @@ function buildCapabilities(
   };
 
   const deviceName = flow.device ?? config.device.deviceName;
-  if (deviceName) caps["appium:deviceName"] = deviceName;
+  if (deviceName) {
+    caps["appium:deviceName"] = deviceName;
+    // udid pins the session to a specific device — essential when several
+    // devices/emulators are attached (parallel runs).
+    caps["appium:udid"] = deviceName;
+  }
 
   const appPath = flow.app?.appPath ?? config.device.appPath;
   if (appPath) caps["appium:app"] = appPath;

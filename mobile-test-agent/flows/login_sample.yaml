@@ -1,0 +1,8 @@
+# Steps are plain English — typos in verbs are tolerated.
+steps:
+  - Tap ok continue
+  - Enter username as hello
+  - Enter pin as 7807283
+  - Enter date of birth as 01 01 1990
+  - Tap on account number 1238735444
+  - Verify account details is visible

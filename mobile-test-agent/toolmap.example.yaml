@@ -1,0 +1,18 @@
+# Optional: re-map logical tool names if your appium-mcp version renames
+# tools.  Run `python -m mobile_test_agent list-tools` to see what your
+# server exposes, then point AGENT_TOOLMAP at a copy of this file.
+#
+# logical_name: [candidate tool names, tried in order]
+
+page_source: [appium_get_page_source]
+screenshot: [appium_screenshot]
+find: [appium_find_element]
+set_value: [appium_set_value]
+gesture: [appium_gesture]
+perform_actions: [appium_perform_actions]
+session: [appium_session_management]
+keyboard: [appium_mobile_keyboard]
+device: [appium_mobile_device_control]
+app_lifecycle: [appium_app_lifecycle]
+alert: [appium_alert]
+ai: [appium_ai]

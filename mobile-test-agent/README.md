@@ -123,7 +123,8 @@ exact token usage, so reliability is measurable, not vibes.
 
 ```bash
 cd mobile-test-agent
-pip install -r requirements.txt        # mcp, requests, pyyaml
+npm install
+npm run build                          # tsc -> dist/
 
 # appium-mcp prerequisites: Node 22+, JDK 8+, ANDROID_HOME (Android) / Xcode (iOS)
 # The agent launches `npx -y appium-mcp@latest` itself over stdio.
@@ -137,20 +138,23 @@ export AGENT_MODEL=gpt-oss:120b        # any Ollama Cloud model
 
 ```bash
 # parse a flow offline (shows which steps are deterministic)
-python -m mobile_test_agent dry-run flows/login_sample.yaml
+npx tsx src/cli.ts dry-run flows/login_sample.yaml     # or: node dist/cli.js ...
 
 # run on a device
-python -m mobile_test_agent run flows/login_sample.yaml \
+node dist/cli.js run flows/login_sample.yaml \
     --platform android --caps caps.json --report report.json
 
 # fully deterministic (0 LLM tokens)
-python -m mobile_test_agent run flows/login_sample.yaml --no-llm
+node dist/cli.js run flows/login_sample.yaml --no-llm
 
 # enable appium-mcp's vision fallback as the last resort
-python -m mobile_test_agent run flows/login_sample.yaml --vision
+node dist/cli.js run flows/login_sample.yaml --vision
 
 # see what tools your appium-mcp version exposes (for toolmap overrides)
-python -m mobile_test_agent list-tools
+node dist/cli.js list-tools
+
+# offline test suite
+npm test
 ```
 
 `caps.json` example:
@@ -167,17 +171,20 @@ python -m mobile_test_agent list-tools
 ## 5. Layout
 
 ```
-mobile_test_agent/
-  parser.py      # NL grammar -> typed commands (typo-tolerant, 0 tokens)
-  snapshot.py    # page-source XML -> compact element table + idle-hash
-  matcher.py     # deterministic element resolution (fuzzy, acronyms, digits)
-  mcp_client.py  # MCP stdio client for appium-mcp (+ toolmap overrides)
-  actions.py     # executors: taps, typing, date pickers, toggles, scrolls
-  verify.py      # per-command postconditions (the VERIFY in find-act-verify)
-  agent.py       # orchestrator: retry ladder + LLM escalation + reporting
-  llm.py         # Ollama Cloud client (structured outputs, token metering)
-  config.py      # all tunables (thresholds, timeouts, models, toolmap)
-tests/           # offline suite: 18 tests, no device or network needed
+src/
+  parser.ts      # NL grammar -> typed commands (typo-tolerant, 0 tokens)
+  snapshot.ts    # page-source XML -> compact element table + idle-hash
+  matcher.ts     # deterministic element resolution (fuzzy, acronyms, digits)
+  similarity.ts  # dependency-free Dice-bigram string similarity
+  mcpClient.ts   # MCP stdio client for appium-mcp (+ toolmap overrides)
+  actions.ts     # executors: taps, typing, date pickers, toggles, scrolls
+  verify.ts      # per-command postconditions (the VERIFY in find-act-verify)
+  agent.ts       # orchestrator: retry ladder + LLM escalation + reporting
+  llm.ts         # Ollama Cloud client (structured outputs, token metering)
+  config.ts      # all tunables (thresholds, timeouts, models, toolmap)
+  cli.ts         # run | dry-run | list-tools
+  index.ts       # library exports
+tests/           # offline vitest suite: 18 tests, no device or network needed
 flows/           # sample flow using the steps from the task description
 ```
 

@@ -1,0 +1,56 @@
+services:
+  main-agent:
+    build: .
+    command: npm run start:main
+    ports:
+      - "4000:4000"
+    environment:
+      MAIN_PORT: "4000"
+      # URLs the orchestrator uses to fetch agent cards (docker DNS names)
+      EXECUTOR_URL: http://executor-agent:4001
+      VERIFIER_URL: http://verifier-agent:4002
+      LOG_DIR: /app/logs
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      - executor-agent
+      - verifier-agent
+    networks: [a2a-net]
+
+  executor-agent:
+    build: .
+    command: npm run start:executor
+    ports:
+      - "4001:4001"
+    environment:
+      EXECUTOR_PORT: "4001"
+      # URL advertised in this agent's card — must be reachable BY OTHER AGENTS,
+      # hence the docker DNS name, not localhost.
+      EXECUTOR_URL: http://executor-agent:4001
+      OLLAMA_HOST: ${OLLAMA_HOST:-https://ollama.com}
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gpt-oss:120b}
+      LOG_DIR: /app/logs
+    volumes:
+      - ./logs:/app/logs
+    networks: [a2a-net]
+
+  verifier-agent:
+    build: .
+    command: npm run start:verifier
+    ports:
+      - "4002:4002"
+    environment:
+      VERIFIER_PORT: "4002"
+      VERIFIER_URL: http://verifier-agent:4002
+      OLLAMA_HOST: ${OLLAMA_HOST:-https://ollama.com}
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gpt-oss:120b}
+      LOG_DIR: /app/logs
+    volumes:
+      - ./logs:/app/logs
+    networks: [a2a-net]
+
+networks:
+  a2a-net:
+    driver: bridge

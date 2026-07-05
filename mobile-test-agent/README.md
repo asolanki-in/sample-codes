@@ -101,7 +101,7 @@ an escape hatch**, over the official appium-mcp toolset.
 
 | Component | Strategy |
 |---|---|
-| **Date pickers** | Editable field → type formatted date. Android calendar mode → year list scroll + month arrows + day cell (content-desc aware). Android spinner mode → per-column `NumberPicker` spinning with value feedback. iOS → `PickerWheel` direct `set_value`. Then auto-tap OK/Done and **verify the field shows the date**. |
+| **Date pickers** | Editable field → type formatted date. Android calendar mode → Material "Switch to text input mode" first (type the date), else year list scroll + month arrows + day cell (content-desc aware). Android spinner mode → type into the `NumberPicker`'s inner EditText, swipe-per-column fallback with value feedback. iOS wheels → direct `set_value` per `PickerWheel`. iOS inline/compact calendar (iOS 14+) → tap the "Month Year" header to flip into wheels and set them, chevron navigation fallback, day cell by accessibility label. Then auto-tap OK/Done and **verify the field shows the date**. |
 | **Toggles / switches / checkboxes** | State-aware: reads `checked`, taps **only if needed**, re-reads to verify, one corrective retry. "Turn on X" when X is already on is a 0-action pass. |
 | **Dropdowns / spinners / option lists** | Tap anchor → wait for options → scroll-to-find option → tap → verify selection visible. |
 | **Secure fields (PIN/password)** | Auto-detected; verification accepts masked text instead of comparing literals. |

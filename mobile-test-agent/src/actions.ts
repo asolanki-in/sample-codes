@@ -225,6 +225,12 @@ export function refind(snap: Snapshot, old: UIElement): UIElement | undefined {
   return undefined;
 }
 
+export function formatDate(d: SimpleDate, dayFirst: boolean): string {
+  const dd = String(d.day).padStart(2, "0");
+  const mm = String(d.month).padStart(2, "0");
+  return dayFirst ? `${dd}/${mm}/${d.year}` : `${mm}/${dd}/${d.year}`;
+}
+
 export const findPicker = (snap: Snapshot): UIElement | undefined =>
   snap.elements.find(
     (el) => ANDROID_PICKER.has(el.fullTag) || IOS_PICKER.has(el.fullTag),
@@ -243,12 +249,7 @@ export async function setDate(
 
   // If the matched field is an editable text input, just type the date.
   if (fieldEl?.editable) {
-    const dd = String(target.day).padStart(2, "0");
-    const mm = String(target.month).padStart(2, "0");
-    const formatted = cfg.dayFirstDates
-      ? `${dd}/${mm}/${target.year}`
-      : `${mm}/${dd}/${target.year}`;
-    await dev.typeText(fieldEl, formatted);
+    await dev.typeText(fieldEl, formatDate(target, cfg.dayFirstDates));
     return true;
   }
 
@@ -259,7 +260,8 @@ export async function setDate(
   }
 
   const ok = cfg.platform === "ios"
-    ? await iosPickerWheels(dev, snap, target)
+    ? (await iosPickerWheels(dev, snap, target)) ||
+      (await iosCalendarPicker(dev, target))
     : await androidDatePicker(dev, snap, target);
   if (!ok) return false;
   await tapConfirm(dev);
@@ -314,6 +316,113 @@ async function androidDatePicker(
   return androidCalendarPicker(dev, target);
 }
 
+/** iOS 14+ inline/compact calendar (UIDatePickerStyle.inline / .compact). */
+async function iosCalendarPicker(
+  dev: DeviceFacade, target: SimpleDate,
+): Promise<boolean> {
+  let snap = await dev.snapshot();
+  const monthName = MONTH_NAMES[target.month - 1];
+
+  const shown = shownMonthYear(snap);
+  if (shown && (shown[1] !== target.year || shown[0] !== target.month)) {
+    // Preferred: tap the "Month Year" header — the calendar flips into
+    // month+year picker wheels, which XCUITest can set directly.
+    const header = findMonthYearHeader(snap);
+    if (header) {
+      await dev.tap(header);
+      const flipped = await dev.stableSnapshot(3000);
+      const wheels = flipped.elements.filter(
+        (e) => e.fullTag === "XCUIElementTypePickerWheel",
+      );
+      if (wheels.length) {
+        for (const wheel of wheels) {
+          const isYear = /^\d{4}$/.test((wheel.value || wheel.text).trim());
+          const val = isYear ? String(target.year) : monthName;
+          const [strategy, selector] = locator(wheel);
+          try {
+            await dev.mcp.tryCall("set_value", [
+              { text: val, strategy, selector },
+              { value: val, strategy, selector },
+            ]);
+          } catch (err) {
+            if (!(err instanceof ToolCallError)) throw err;
+            break; // fall through to chevron navigation
+          }
+          await sleep(300);
+        }
+        // collapse the wheels back into the day grid
+        const again = findMonthYearHeader(await dev.snapshot());
+        if (again) {
+          await dev.tap(again);
+          await dev.stableSnapshot(3000);
+        }
+      }
+    }
+    // Fallback (and residual-drift correction): chevron navigation.
+    await stepMonthsWithArrows(dev, target);
+  }
+
+  // Day cells carry the full date in their accessibility name
+  // ("Thursday, 1 January"), or just the bare day number as the label.
+  snap = await dev.snapshot();
+  const monthLow = monthName.toLowerCase();
+  for (const el of snap.elements) {
+    const label = norm(`${el.desc} ${el.text}`);
+    if (label.includes(monthLow) &&
+        label.split(" ").includes(String(target.day))) {
+      await dev.tap(el);
+      return true;
+    }
+  }
+  const grid = snap.elements.find((e) => e.fullTag === "XCUIElementTypeDatePicker");
+  const dayEl = snap.elements.find(
+    (el) => el.text.trim() === String(target.day) &&
+            (!grid || boundsContain(grid.bounds, el.bounds)),
+  );
+  if (dayEl) {
+    await dev.tap(dayEl);
+    return true;
+  }
+  return false;
+}
+
+/** Clickable "June 2026"-style header of a calendar-mode picker. */
+function findMonthYearHeader(snap: Snapshot): UIElement | undefined {
+  return snap.elements.find((el) => {
+    const label = (el.text || el.desc).trim();
+    const m = label.match(/^([A-Za-z]+)\s+\d{4}$/);
+    if (!m) return false;
+    const month = m[1].toLowerCase();
+    return MONTH_NAMES.some(
+      (n) => n.toLowerCase() === month || n.slice(0, 3).toLowerCase() === month,
+    );
+  });
+}
+
+/** Step month-by-month via next/previous chevrons, bounded to 4 years. */
+async function stepMonthsWithArrows(
+  dev: DeviceFacade, target: SimpleDate,
+): Promise<void> {
+  for (let i = 0; i < 48; i++) {
+    const snap = await dev.snapshot();
+    const shown = shownMonthYear(snap);
+    if (!shown) return;
+    const [sm, sy] = shown;
+    if (sy === target.year && sm === target.month) return;
+    const forward = sy < target.year || (sy === target.year && sm < target.month);
+    const arrow = findDesc(snap, forward ? "next month" : "previous month");
+    if (!arrow) return;
+    await dev.tap(arrow);
+    await sleep(300);
+  }
+}
+
+const boundsContain = (
+  outer: UIElement["bounds"], inner: UIElement["bounds"], tolerance = 4,
+): boolean =>
+  inner[0] >= outer[0] - tolerance && inner[1] >= outer[1] - tolerance &&
+  inner[2] <= outer[2] + tolerance && inner[3] <= outer[3] + tolerance;
+
 /** Spinner-mode DatePicker: three NumberPicker columns to spin. */
 async function androidSpinnerPicker(
   dev: DeviceFacade, target: SimpleDate,
@@ -335,12 +444,34 @@ async function androidSpinnerPicker(
   return ok;
 }
 
-/** Swipe a NumberPicker column until its value matches `want`. */
+/** Set a NumberPicker column: type into its inner EditText when possible,
+ *  otherwise swipe until the centered value matches `want`. */
 async function spinColumn(
   dev: DeviceFacade, column: UIElement, want: string, maxSpins = 24,
 ): Promise<boolean> {
   const wantN = norm(want);
   const numeric = /^\d+$/.test(wantN);
+
+  // fast path: the column's centered value is an EditText — tap and type
+  const snap0 = await dev.snapshot();
+  const col0 = refind(snap0, column) ?? column;
+  const inner = snap0.elements.find(
+    (e) => e.editable && boundsContain(col0.bounds, e.bounds),
+  );
+  if (inner) {
+    try {
+      await dev.typeText(inner, want);
+      await dev.hideKeyboard();
+      const check = await dev.stableSnapshot(2000);
+      const current = columnValue(check, refind(check, col0) ?? col0);
+      if (current !== undefined &&
+          (norm(current) === wantN || textScore(want, current) >= 0.9)) {
+        return true;
+      }
+    } catch (err) {
+      if (!(err instanceof ToolCallError) && !(err instanceof ActionError)) throw err;
+    }
+  }
   for (let i = 0; i < maxSpins; i++) {
     const snap = await dev.snapshot();
     const col = refind(snap, column) ?? column;
@@ -381,6 +512,19 @@ async function androidCalendarPicker(
 ): Promise<boolean> {
   let snap = await dev.snapshot();
 
+  // 0. Material pickers offer a text-input mode ("Switch to text input
+  //    mode" pencil) — typing the date beats navigating the grid.
+  const switchToInput = findDesc(snap, "switch to text input");
+  if (switchToInput) {
+    await dev.tap(switchToInput);
+    const inputSnap = await dev.stableSnapshot(4000);
+    const field = inputSnap.elements.find((e) => e.editable);
+    if (field) {
+      await dev.typeText(field, formatDate(target, dev.cfg.dayFirstDates));
+      return true;
+    }
+  }
+
   // 1. year — tap the year header, then scroll the year list
   const yearEl = findText(snap, /^\d{4}$/);
   if (yearEl && yearEl.text !== String(target.year)) {
@@ -397,18 +541,7 @@ async function androidCalendarPicker(
   }
 
   // 2. month — use next/prev arrows, bounded to 4 years of clicks
-  for (let i = 0; i < 48; i++) {
-    snap = await dev.snapshot();
-    const shown = shownMonthYear(snap);
-    if (!shown) break;
-    const [sm, sy] = shown;
-    if (sy === target.year && sm === target.month) break;
-    const forward = sy < target.year || (sy === target.year && sm < target.month);
-    const arrow = findDesc(snap, forward ? "next month" : "previous month");
-    if (!arrow) break;
-    await dev.tap(arrow);
-    await sleep(300);
-  }
+  await stepMonthsWithArrows(dev, target);
 
   // 3. day — cells carry the full date in content-desc, or bare day text
   snap = await dev.snapshot();

@@ -140,6 +140,60 @@ describe("Android date pickers", () => {
     expect(typed).toBe("01/01/1990"); // dayFirstDates default
   });
 
+  it("finds the edit toggle by resource-id (localized desc) and follows the field's hint order", async () => {
+    // 05 12 1990 with day-first config = 5 Dec 1990; the revealed field
+    // asks for mm/dd/yyyy, so the hint must win over the config.
+    const usCommand: Command = {
+      ...dobCommand, value: "05 12 1990", raw: "Enter date of birth as 05 12 1990",
+    };
+    let state = 0;
+    const body = () => state === 0
+      ? `<android.widget.ImageButton content-desc="Zur Texteingabe wechseln" resource-id="com.app:id/mtrl_picker_header_toggle" class="android.widget.ImageButton" clickable="true" bounds="[900,300][1000,400]" displayed="true"/>
+         <android.widget.TextView text="December 1990" class="android.widget.TextView" bounds="[100,300][500,380]" displayed="true"/>`
+      : `<android.widget.EditText text="" hint="mm/dd/yyyy" resource-id="com.app:id/mtrl_picker_text_input_date" class="android.widget.EditText" clickable="true" bounds="[100,300][900,420]" displayed="true"/>`;
+    const xml = () => `<?xml version='1.0'?>
+      <hierarchy>
+        <android.widget.FrameLayout class="android.widget.FrameLayout" bounds="[0,200][1080,1200]" displayed="true">
+          ${body()}
+          <android.widget.Button text="OK" class="android.widget.Button" clickable="true" bounds="[800,1100][1000,1180]" displayed="true"/>
+        </android.widget.FrameLayout>
+      </hierarchy>`;
+    let typed = "";
+    const dev = makeFakeDevice({
+      platform: "android",
+      getXml: xml,
+      onTap: (el) => {
+        if (el.resId.includes("mtrl_picker_header_toggle")) state = 1;
+      },
+      onType: (_el, value) => { typed = value; },
+    });
+    expect(await setDate(dev, usCommand, dev.cfg, await dev.snapshot(), undefined)).toBe(true);
+    expect(typed).toBe("12/05/1990"); // hint order, not config order
+  });
+
+  it("types immediately when the dialog already opened in text-input mode", async () => {
+    const xml = `<?xml version='1.0'?>
+      <hierarchy>
+        <android.widget.FrameLayout class="android.widget.FrameLayout" bounds="[0,200][1080,1200]" displayed="true">
+          <android.widget.ImageButton content-desc="Switch to calendar input mode" resource-id="com.app:id/mtrl_picker_header_toggle" class="android.widget.ImageButton" clickable="true" bounds="[900,300][1000,400]" displayed="true"/>
+          <android.widget.EditText text="" hint="dd/mm/yyyy" resource-id="com.app:id/mtrl_picker_text_input_date" class="android.widget.EditText" clickable="true" bounds="[100,300][900,420]" displayed="true"/>
+          <android.widget.Button text="OK" class="android.widget.Button" clickable="true" bounds="[800,1100][1000,1180]" displayed="true"/>
+        </android.widget.FrameLayout>
+      </hierarchy>`;
+    const tapped: string[] = [];
+    let typed = "";
+    const dev = makeFakeDevice({
+      platform: "android",
+      getXml: () => xml,
+      onTap: (el) => tapped.push(el.resId || el.text),
+      onType: (_el, value) => { typed = value; },
+    });
+    expect(await run(dev)).toBe(true);
+    expect(typed).toBe("01/01/1990");
+    // must NOT tap the toggle — that would flip back to the calendar grid
+    expect(tapped.some((t) => t.includes("mtrl_picker_header_toggle"))).toBe(false);
+  });
+
   it("taps the calendar day cell via its content-desc", async () => {
     const xml = `<?xml version='1.0'?>
       <hierarchy>

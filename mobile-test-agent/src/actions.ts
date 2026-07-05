@@ -231,6 +231,41 @@ export function formatDate(d: SimpleDate, dayFirst: boolean): string {
   return dayFirst ? `${dd}/${mm}/${d.year}` : `${mm}/${dd}/${d.year}`;
 }
 
+/** "dd/mm/yyyy"-style pattern from a field's hint (or placeholder text). */
+function datePatternFrom(field?: UIElement): string | undefined {
+  for (const cand of [field?.hint, field?.text]) {
+    const p = (cand ?? "").trim().toLowerCase();
+    if (p && /^[dmy\W]+$/.test(p) &&
+        p.includes("d") && p.includes("m") && p.includes("y")) {
+      return p;
+    }
+  }
+  return undefined;
+}
+
+/** Format a date in the order the field itself asks for; the field's own
+ *  hint beats the day-first config (US pickers say "mm/dd/yyyy"). */
+export function formatDateForField(
+  d: SimpleDate, field: UIElement | undefined, dayFirst: boolean,
+): string {
+  const pattern = datePatternFrom(field);
+  if (!pattern) return formatDate(d, dayFirst);
+  const sep = pattern.match(/[^dmy]/)?.[0] ?? "/";
+  const parts: Array<[number, string]> = [
+    [pattern.indexOf("d"), String(d.day).padStart(2, "0")],
+    [pattern.indexOf("m"), String(d.month).padStart(2, "0")],
+    [pattern.indexOf("y"), String(d.year)],
+  ];
+  return parts.sort((a, b) => a[0] - b[0]).map((p) => p[1]).join(sep);
+}
+
+/** The EditText a Material date picker reveals in text-input mode. */
+const materialDateField = (snap: Snapshot): UIElement | undefined =>
+  snap.elements.find(
+    (e) => e.editable &&
+      (resIdTail(e).includes("picker_text_input") || !!datePatternFrom(e)),
+  );
+
 export const findPicker = (snap: Snapshot): UIElement | undefined =>
   snap.elements.find(
     (el) => ANDROID_PICKER.has(el.fullTag) || IOS_PICKER.has(el.fullTag),
@@ -247,9 +282,10 @@ export async function setDate(
   const target = parseDateValue(command.value ?? "", cfg.dayFirstDates);
   if (!target) throw new ActionError(`cannot parse date from '${command.value}'`);
 
-  // If the matched field is an editable text input, just type the date.
+  // If the matched field is an editable text input, just type the date
+  // (in the order the field's own hint asks for, e.g. "MM/DD/YYYY").
   if (fieldEl?.editable) {
-    await dev.typeText(fieldEl, formatDate(target, cfg.dayFirstDates));
+    await dev.typeText(fieldEl, formatDateForField(target, fieldEl, cfg.dayFirstDates));
     return true;
   }
 
@@ -512,15 +548,27 @@ async function androidCalendarPicker(
 ): Promise<boolean> {
   let snap = await dev.snapshot();
 
-  // 0. Material pickers offer a text-input mode ("Switch to text input
-  //    mode" pencil) — typing the date beats navigating the grid.
-  const switchToInput = findDesc(snap, "switch to text input");
+  // 0. Material pickers: text entry beats grid navigation.
+  //    (a) dialog already opened in text-input mode — type straight away
+  const preField = materialDateField(snap);
+  if (preField) {
+    await dev.typeText(
+      preField, formatDateForField(target, preField, dev.cfg.dayFirstDates));
+    return true;
+  }
+  //    (b) flip via the edit/pencil toggle — resource-id is locale-proof,
+  //        the English content-desc is only a fallback
+  const switchToInput =
+    snap.elements.find((e) => resIdTail(e) === "mtrl_picker_header_toggle") ??
+    findDesc(snap, "switch to text input");
   if (switchToInput) {
     await dev.tap(switchToInput);
     const inputSnap = await dev.stableSnapshot(4000);
-    const field = inputSnap.elements.find((e) => e.editable);
+    const field =
+      materialDateField(inputSnap) ?? inputSnap.elements.find((e) => e.editable);
     if (field) {
-      await dev.typeText(field, formatDate(target, dev.cfg.dayFirstDates));
+      await dev.typeText(
+        field, formatDateForField(target, field, dev.cfg.dayFirstDates));
       return true;
     }
   }

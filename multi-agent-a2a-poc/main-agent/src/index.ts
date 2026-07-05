@@ -28,6 +28,7 @@ import {
   validateBody,
 } from "../../shared/guardrails.js";
 import { jsonRpcEndpoint, JsonRpcHandlerError } from "../../shared/jsonrpc-server.js";
+import { chat, type ChatMessage } from "../../shared/llm.js";
 import { TaskStore } from "../../shared/task-store.js";
 import {
   JsonRpcErrorCodes,
@@ -98,6 +99,119 @@ async function discoverAgents(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Guardrail #9: task-scope gate
+//
+// The orchestrator must ONLY take on work its sub-agents can actually do.
+// Anything else ("write me a poem", "book a flight", "give legal advice") is
+// REJECTED up front with an "I can only do X" message — the task never
+// reaches the executor.
+//
+// This is code, not prompt text: the capability list is derived from the
+// *cached agent cards* (so it tracks what the sub-agents actually advertise),
+// the classifier's output is Zod-validated, and the gate FAILS CLOSED — if
+// the classifier errors or returns garbage twice, the task is rejected.
+// ---------------------------------------------------------------------------
+
+const scopeVerdictSchema = z.object({
+  in_scope: z.boolean(),
+  reason: z.string().min(1).max(500),
+});
+
+const scopeVerdictJsonSchema = {
+  type: "object",
+  properties: {
+    in_scope: { type: "boolean" },
+    reason: { type: "string" },
+  },
+  required: ["in_scope", "reason"],
+};
+
+/** Human-readable capability list, built from the sub-agents' cached cards. */
+function capabilitySummary(): string {
+  return [executorCard, verifierCard]
+    .map(
+      (card) =>
+        `- ${card.name}: ${card.skills.map((s) => `${s.name} (${s.description})`).join("; ")}`,
+    )
+    .join("\n");
+}
+
+/** The refusal text returned to the caller when a task is out of scope. */
+function refusalMessage(reason: string): string {
+  return (
+    `I can only handle tasks my sub-agents support: gathering system/file/web information ` +
+    `via the executor's tools (run_shell_command, read_file, web_lookup) and verifying its output. ` +
+    `This request is outside that scope: ${reason}`
+  );
+}
+
+async function checkTaskScope(
+  taskId: string,
+  userTask: string,
+): Promise<{ inScope: boolean; reason: string }> {
+  const messages: ChatMessage[] = [
+    {
+      role: "system",
+      content:
+        "You are a strict scope gate for an orchestrator agent. The orchestrator can ONLY accomplish " +
+        "a task by delegating to these downstream agent skills:\n" +
+        capabilitySummary() +
+        "\nDecide whether the task below can be fully accomplished using ONLY those skills. " +
+        "Tasks needing creativity, opinions, purchases, real-world actions, or any capability not listed are out of scope. " +
+        'Respond ONLY with JSON: {"in_scope": boolean, "reason": string}.',
+    },
+    { role: "user", content: `TASK:\n${userTask}` },
+  ];
+
+  // Same enforcement pattern as the verifier: Zod-validate, one correction retry.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const result = await chat(AGENT_NAME, { messages, format: scopeVerdictJsonSchema });
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(result.message.content);
+      } catch {
+        parsed = undefined;
+      }
+      const verdict = scopeVerdictSchema.safeParse(parsed);
+      if (verdict.success) {
+        if (!verdict.data.in_scope) {
+          audit(AGENT_NAME, {
+            event: "guardrail",
+            from: AGENT_NAME,
+            to: AGENT_NAME,
+            taskId,
+            inputSummary: summarize(userTask),
+            detail: { guardrail: "task-scope", inScope: false, reason: summarize(verdict.data.reason) },
+          });
+        }
+        return { inScope: verdict.data.in_scope, reason: verdict.data.reason };
+      }
+      messages.push(result.message);
+      messages.push({
+        role: "user",
+        content:
+          'Your previous response was not valid JSON matching {"in_scope": boolean, "reason": string}. ' +
+          "Respond again with ONLY that JSON object.",
+      });
+    } catch (err) {
+      console.error(`[${AGENT_NAME}] scope classifier attempt ${attempt} failed:`, err);
+    }
+  }
+
+  // Fail CLOSED: if we can't establish the task is in scope, we refuse it.
+  audit(AGENT_NAME, {
+    event: "guardrail",
+    from: AGENT_NAME,
+    to: AGENT_NAME,
+    taskId,
+    inputSummary: summarize(userTask),
+    detail: { guardrail: "task-scope", inScope: false, reason: "scope classifier unavailable — failing closed" },
+  });
+  return { inScope: false, reason: "the scope check could not be completed, so the task is refused by default" };
+}
+
+// ---------------------------------------------------------------------------
 // Orchestration flow
 // ---------------------------------------------------------------------------
 
@@ -119,6 +233,8 @@ interface Attempt {
 interface OrchestrationResult {
   answer: string;
   verified: boolean;
+  /** True when the scope gate refused the task before any delegation. */
+  rejected?: boolean;
   attempts: Attempt[];
   injectionFlagged: boolean;
   injectionMatches: string[];
@@ -150,11 +266,12 @@ async function delegateAndVerify(contextId: string, taskText: string, attemptNo:
   return attempt;
 }
 
-async function orchestrate(localTask: A2ATask, userTask: string): Promise<OrchestrationResult> {
+async function orchestrate(
+  localTask: A2ATask,
+  userTask: string,
+  scan: { flagged: boolean; matches: string[] },
+): Promise<OrchestrationResult> {
   taskStore.transition(localTask.id, "working");
-
-  // Guardrail #2: scan the raw user task before it goes anywhere near an LLM.
-  const scan = scanForInjection(AGENT_NAME, userTask, localTask.id);
 
   const attempts: Attempt[] = [];
 
@@ -202,8 +319,34 @@ async function runTask(inbound: A2AMessage): Promise<A2ATask> {
   const userTask = messageText(inbound);
   const localTask = taskStore.create(inbound);
 
+  // Guardrail #2: scan the raw user task before it goes anywhere near an LLM.
+  const scan = scanForInjection(AGENT_NAME, userTask, localTask.id);
+
+  // Guardrail #9: scope gate — refuse anything the sub-agents can't do.
+  // This runs BEFORE orchestration, so an out-of-scope task never reaches
+  // the executor. The task goes submitted -> rejected, and the caller gets
+  // an explicit "I can only do X" answer instead of a best-effort attempt.
+  const scope = await checkTaskScope(localTask.id, userTask);
+  if (!scope.inScope) {
+    const result: OrchestrationResult = {
+      answer: refusalMessage(scope.reason),
+      verified: false,
+      rejected: true,
+      attempts: [],
+      injectionFlagged: scan.flagged,
+      injectionMatches: scan.matches,
+    };
+    taskStore.addArtifact(localTask.id, "final-result", JSON.stringify(result, null, 2));
+    taskStore.transition(
+      localTask.id,
+      "rejected",
+      textMessage("agent", result.answer, { taskId: localTask.id, contextId: localTask.contextId }),
+    );
+    return taskStore.get(localTask.id)!;
+  }
+
   try {
-    const result = await orchestrate(localTask, userTask);
+    const result = await orchestrate(localTask, userTask, scan);
     taskStore.addArtifact(localTask.id, "final-result", JSON.stringify(result, null, 2));
     if (result.answer && (result.verified || result.attempts.at(-1)?.executorState === "completed")) {
       taskStore.transition(localTask.id, "completed");
@@ -260,7 +403,11 @@ app.post(
     // Unwrap the aggregated result for a friendly HTTP response.
     const raw = localTask.artifacts?.find((a) => a.name === "final-result")?.parts[0]?.text;
     const result = raw ? JSON.parse(raw) : undefined;
-    res.status(localTask.status.state === "completed" ? 200 : 502).json({
+    const httpStatus =
+      localTask.status.state === "completed" ? 200
+      : localTask.status.state === "rejected" ? 422 // scope gate said no
+      : 502;
+    res.status(httpStatus).json({
       taskId: localTask.id,
       contextId: localTask.contextId,
       state: localTask.status.state,

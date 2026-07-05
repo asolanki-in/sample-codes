@@ -9,6 +9,11 @@ services:
       # URLs the orchestrator uses to fetch agent cards (docker DNS names)
       EXECUTOR_URL: http://executor-agent:4001
       VERIFIER_URL: http://verifier-agent:4002
+      # The orchestrator has no tools, but its scope-gate guardrail makes one
+      # LLM classification call per task, so it needs the LLM backend too.
+      OLLAMA_HOST: ${OLLAMA_HOST:-https://ollama.com}
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gpt-oss:120b}
       LOG_DIR: /app/logs
     volumes:
       - ./logs:/app/logs

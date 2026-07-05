@@ -156,6 +156,7 @@ Tasks live in an in-memory `Map` keyed by uuid and follow the A2A state machine
 
 ```
 submitted ──> working ──> completed | failed | input-required
+     └──────> rejected   (scope gate refused the task before any work started)
 ```
 
 ## Walkthrough of one end-to-end request
@@ -169,7 +170,25 @@ What happens for the `POST /task` above, and **where each guardrail fires**:
      "ignore previous instructions" / role overrides. Matches are **logged and flagged**
      (surfaced as `injectionFlagged` in the response) but the text is *not* silently
      modified — stripping would hide the attack from downstream auditing.
-   - A local task is created (`submitted` → `working`).
+   - A local task is created in `submitted` state.
+   - *Guardrail — task-scope gate*: the orchestrator only accepts work its two
+     sub-agents can actually do. A JSON-constrained LLM classification call decides
+     `{in_scope, reason}` against the capability list **derived from the cached agent
+     cards** (so it tracks what the sub-agents really advertise). The verdict is
+     Zod-validated with one correction retry, and the gate **fails closed** — if the
+     classifier is unreachable or returns garbage twice, the task is refused.
+     Out-of-scope ⇒ the task goes `submitted → rejected`, the executor is never
+     called, and the caller gets HTTP `422` with an explicit refusal:
+
+     ```json
+     {
+       "state": "rejected",
+       "answer": "I can only handle tasks my sub-agents support: gathering system/file/web information via the executor's tools (run_shell_command, read_file, web_lookup) and verifying its output. This request is outside that scope: This requires creative writing or real-world actions, not system/file/web lookup.",
+       "rejected": true,
+       "attempts": []
+     }
+     ```
+   - In-scope ⇒ the task moves to `working` and orchestration begins.
 
 2. **`main-agent` → `executor-agent`: `message/send`** (using the cached agent card's url)
    - *Guardrail — timeout + retry*: the HTTP call aborts after **15s**; one retry on
@@ -227,6 +246,16 @@ How the events look (first three captured from a real run):
 {"agent":"main-agent","detail":{"guardrail":"input-validation","issues":[{"path":["task"],"message":"Required"}]}}
 {"agent":"verifier-agent","detail":{"guardrail":"output-schema","attempt":1,"willRetry":true}}
 {"agent":"verifier-agent","detail":{"guardrail":"rate-limit","limit":"10/min"}}
+{"agent":"main-agent","detail":{"guardrail":"task-scope","inScope":false,"reason":"This requires creative writing or real-world actions, not system/file/web lookup."}}
+```
+
+Try the scope gate yourself:
+
+```bash
+curl -s -X POST http://localhost:4000/task \
+  -H 'content-type: application/json' \
+  -d '{"task": "Write me a romantic poem about the moon."}' | jq '{state, answer}'
+# -> HTTP 422, state "rejected", answer starts with "I can only handle tasks my sub-agents support: ..."
 ```
 
 ## Guardrail summary
@@ -241,6 +270,7 @@ How the events look (first three captured from a real run):
 | 6 | Timeout + retry | every inter-agent call | 15s `AbortSignal` per attempt, single retry on transport errors |
 | 7 | Audit log | every agent | one JSON line per event to `logs/<agent>.jsonl` |
 | 8 | Rate limit | every agent endpoint | in-memory token bucket, 10 req/min ⇒ `429` |
+| 9 | Task-scope gate | main-agent, before delegation | LLM classifier over the sub-agents' card-declared skills, Zod-validated, fail-closed; out-of-scope ⇒ `rejected` + "I can only do X" refusal, executor never invoked |
 
 ## What's deliberately out of scope
 

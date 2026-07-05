@@ -10,10 +10,11 @@ import { v4 as uuidv4 } from "uuid";
 import type { A2AMessage, A2ATask, Artifact, TaskState } from "./types.js";
 
 const LEGAL_TRANSITIONS: Record<TaskState, TaskState[]> = {
-  submitted: ["working", "failed"],
+  submitted: ["working", "failed", "rejected"],
   working: ["completed", "failed", "input-required"],
   completed: [],
   failed: [],
+  rejected: [], // refused by the scope gate — no work was ever started
   "input-required": [], // terminal for this PoC (no multi-turn continuation)
 };
 

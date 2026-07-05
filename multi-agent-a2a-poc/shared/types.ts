@@ -69,15 +69,17 @@ export interface A2AMessage {
  * Task state machine:
  *
  *   submitted ──> working ──> completed
- *                    │  └───> failed
- *                    └──────> input-required   (terminal for this PoC too)
+ *       │            │  └───> failed
+ *       │            └──────> input-required   (terminal for this PoC too)
+ *       └───> rejected   (scope gate: task refused before any work started)
  */
 export type TaskState =
   | "submitted"
   | "working"
   | "completed"
   | "failed"
-  | "input-required";
+  | "input-required"
+  | "rejected";
 
 export interface TaskStatus {
   state: TaskState;

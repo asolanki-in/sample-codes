@@ -40,6 +40,7 @@ export const JsonRpcErrorCodes = {
   INTERNAL_ERROR: -32603,
   // A2A-specific errors (from the A2A spec's reserved range)
   TASK_NOT_FOUND: -32001,
+  UNSUPPORTED_OPERATION: -32004, // e.g. sending input to a task that isn't waiting for any
   RATE_LIMITED: -32005,
 } as const;
 
@@ -69,8 +70,10 @@ export interface A2AMessage {
  * Task state machine:
  *
  *   submitted ──> working ──> completed
- *       │            │  └───> failed
- *       │            └──────> input-required   (terminal for this PoC too)
+ *       │          ^  │  └───> failed
+ *       │          │  └──────> input-required ──┐   (agent paused, waiting for
+ *       │          └────────────────────────────┘    the user; a message/send
+ *       │                                            with this taskId resumes it)
  *       └───> rejected   (scope gate: task refused before any work started)
  */
 export type TaskState =
@@ -104,6 +107,24 @@ export interface A2ATask {
   artifacts?: Artifact[];
   /** Message history for this task (inputs received). */
   history?: A2AMessage[];
+  /**
+   * Free-form task metadata. Long-running agents put a TaskProgress under
+   * metadata.progress so pollers get coarse status without streaming.
+   */
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Coarse progress for long-running tasks — deliberately high-level
+ * ("started", "in-progress", "12/20 steps"), not a step-by-step transcript.
+ * Clients read it from task.metadata.progress via tasks/get polling.
+ */
+export interface TaskProgress {
+  phase: "started" | "in-progress" | "waiting-for-input" | "completed" | "failed";
+  stepsCompleted: number;
+  totalSteps: number;
+  note: string;
+  updatedAt: string;
 }
 
 // ---------------------------------------------------------------------------

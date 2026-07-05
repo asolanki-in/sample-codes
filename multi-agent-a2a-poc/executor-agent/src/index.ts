@@ -18,7 +18,7 @@ import {
 } from "../../shared/guardrails.js";
 import { jsonRpcEndpoint, JsonRpcHandlerError } from "../../shared/jsonrpc-server.js";
 import { chat, type ChatMessage } from "../../shared/llm.js";
-import { TaskStore } from "../../shared/task-store.js";
+import { TaskStore, dataFile } from "../../shared/task-store.js";
 import {
   JsonRpcErrorCodes,
   messageText,
@@ -66,7 +66,7 @@ const agentCard: AgentCard = {
   security: [], // no auth on the PoC's trusted docker network
 };
 
-const taskStore = new TaskStore();
+const taskStore = new TaskStore(dataFile(AGENT_NAME));
 
 // ---------------------------------------------------------------------------
 // The ReAct loop

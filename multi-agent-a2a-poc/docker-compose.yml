@@ -9,17 +9,23 @@ services:
       # URLs the orchestrator uses to fetch agent cards (docker DNS names)
       EXECUTOR_URL: http://executor-agent:4001
       VERIFIER_URL: http://verifier-agent:4002
+      MOBILE_URL: http://mobile-agent:4003
+      BROWSER_URL: http://browser-agent:4004
       # The orchestrator has no tools, but its scope-gate guardrail makes one
       # LLM classification call per task, so it needs the LLM backend too.
       OLLAMA_HOST: ${OLLAMA_HOST:-https://ollama.com}
       OLLAMA_API_KEY: ${OLLAMA_API_KEY}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gpt-oss:120b}
       LOG_DIR: /app/logs
+      DATA_DIR: /app/data
     volumes:
       - ./logs:/app/logs
+      - ./data:/app/data
     depends_on:
       - executor-agent
       - verifier-agent
+      - mobile-agent
+      - browser-agent
     networks: [a2a-net]
 
   executor-agent:
@@ -36,8 +42,10 @@ services:
       OLLAMA_API_KEY: ${OLLAMA_API_KEY}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gpt-oss:120b}
       LOG_DIR: /app/logs
+      DATA_DIR: /app/data
     volumes:
       - ./logs:/app/logs
+      - ./data:/app/data
     networks: [a2a-net]
 
   verifier-agent:
@@ -52,8 +60,44 @@ services:
       OLLAMA_API_KEY: ${OLLAMA_API_KEY}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-gpt-oss:120b}
       LOG_DIR: /app/logs
+      DATA_DIR: /app/data
     volumes:
       - ./logs:/app/logs
+      - ./data:/app/data
+    networks: [a2a-net]
+
+  # ---- Long-running automation agents (mocked, no LLM needed) --------------
+
+  mobile-agent:
+    build: .
+    command: npm run start:mobile
+    ports:
+      - "4003:4003"
+    environment:
+      MOBILE_PORT: "4003"
+      MOBILE_URL: http://mobile-agent:4003
+      STEP_MS: "1500" # ~30s for a 20-step task
+      LOG_DIR: /app/logs
+      DATA_DIR: /app/data
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+    networks: [a2a-net]
+
+  browser-agent:
+    build: .
+    command: npm run start:browser
+    ports:
+      - "4004:4004"
+    environment:
+      BROWSER_PORT: "4004"
+      BROWSER_URL: http://browser-agent:4004
+      STEP_MS: "1000" # ~15s for a 15-step task
+      LOG_DIR: /app/logs
+      DATA_DIR: /app/data
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
     networks: [a2a-net]
 
 networks:

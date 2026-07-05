@@ -10,21 +10,24 @@ The LLM backend is the **Ollama chat API** called with raw `fetch` — works aga
 Ollama cloud (`https://ollama.com`) or a local Ollama server.
 
 ```
-                 ┌──────────────────────────┐
-  user           │  MAIN AGENT :4000        │
-  POST /task ───>│  (orchestrator, no tools)│
-                 │  A2A client + server     │
-                 └─────┬──────────────┬─────┘
-        message/send   │              │   message/send
-        "do the task"  │              │   {task, output} -> verdict
-                       v              v
-        ┌──────────────────┐   ┌──────────────────┐
-        │ EXECUTOR :4001   │   │ VERIFIER :4002   │
-        │ ReAct loop +     │   │ single LLM call, │
-        │ 3 mocked tools   │   │ strict JSON out  │
-        └────────┬─────────┘   └────────┬─────────┘
-                 └─────> Ollama API <───┘
-                    (raw fetch, no SDK)
+                 ┌────────────────────────────────────┐
+  user           │  MAIN AGENT :4000                  │
+  POST /task ───>│  (orchestrator, no tools)          │
+  POST /automation  A2A client + server, file-backed  │
+  GET  /automation/:id  task store (survives restarts)│
+                 └──┬──────────┬─────────┬─────────┬──┘
+       message/send │          │         │         │  message/send (async)
+       (blocking)   v          v         v         v  + tasks/get polling
+        ┌───────────────┐ ┌──────────┐ ┌────────┐ ┌─────────┐
+        │ EXECUTOR :4001│ │ VERIFIER │ │ MOBILE │ │ BROWSER │
+        │ ReAct loop +  │ │ :4002    │ │ :4003  │ │ :4004   │
+        │ 3 mock tools  │ │ LLM judge│ │ 20-step│ │ 15-step │
+        └──────┬────────┘ └────┬─────┘ │ mock UI│ │ mock web│
+               │               │       │ + OTP  │ │ + 2FA   │
+               └─> Ollama API <┘       │ pause  │ │ pause   │
+                (raw fetch, no SDK)    └────────┘ └─────────┘
+                                       long-running, persistent,
+                                       resume-after-crash (no LLM)
 ```
 
 ## Layout
@@ -35,11 +38,14 @@ multi-agent-a2a-poc/
 ├── executor-agent/src/index.ts   # ReAct loop with iteration/token guards
 ├── executor-agent/src/tools.ts   # tool registry + allowlist (mocked tools)
 ├── verifier-agent/src/index.ts   # LLM-as-judge with enforced JSON schema
+├── mobile-agent/src/index.ts     # long-running mobile automation (mock, OTP pause)
+├── browser-agent/src/index.ts    # long-running browser automation (mock, 2FA pause)
 ├── shared/
 │   ├── types.ts                  # A2A Task/Message/AgentCard + JSON-RPC envelope
 │   ├── a2a-client.ts             # card discovery, message/send, timeout+retry
 │   ├── jsonrpc-server.ts         # JSON-RPC endpoint plumbing, error objects
-│   ├── task-store.ts             # in-memory Map + task state machine
+│   ├── task-store.ts             # Map + state machine, optional file persistence
+│   ├── automation-agent.ts       # long-running agent factory (steps, pause, resume)
 │   ├── guardrails.ts             # Zod validation, injection scan, rate limiter
 │   ├── llm.ts                    # raw fetch to {OLLAMA_HOST}/api/chat
 │   └── audit.ts                  # jsonl audit logger
@@ -169,11 +175,14 @@ curl -s -X POST http://localhost:4001/ -H 'content-type: application/json' \
 # {"jsonrpc":"2.0","id":2,"error":{"code":-32001,"message":"Task not found: nope"}}
 ```
 
-Tasks live in an in-memory `Map` keyed by uuid and follow the A2A state machine
-(`shared/task-store.ts` throws on illegal transitions):
+Tasks live in a `Map` keyed by uuid (file-backed via `DATA_DIR`, so they survive
+restarts) and follow the A2A state machine (`shared/task-store.ts` throws on illegal
+transitions):
 
 ```
-submitted ──> working ──> completed | failed | input-required
+submitted ──> working ──> completed | failed
+     │         ^   └────> input-required ──┐  (paused for the user; a message/send
+     │         └───────────────────────────┘   with the same taskId resumes it)
      └──────> rejected   (scope gate refused the task before any work started)
 ```
 
@@ -247,6 +256,63 @@ What happens for the `POST /task` above, and **where each guardrail fires**:
      two-entry `attempts` array above).
    - The local task completes (or fails) and the caller gets answer + verdict + trace.
 
+## Long-running automation agents (mobile + browser)
+
+The executor/verifier flow is *synchronous*: `message/send` blocks until the task is
+done. The mobile (`:4003`) and browser (`:4004`) agents demonstrate the **other** A2A
+mode — long-running tasks:
+
+- `message/send` returns **immediately** with the task in `working` state; the (mock)
+  automation steps run in the background of the sub-agent's own process.
+- Progress is **coarse by design** — phase (`started`, `in-progress`,
+  `waiting-for-input`, `completed`) plus `stepsCompleted/totalSteps` in
+  `task.metadata.progress` — polled via `tasks/get`, not a step-by-step stream.
+- Mid-task the agent needs the user (mobile: OTP at step 10; browser: 2FA at step 5):
+  it transitions to **`input-required`** and stops. The user's answer travels as a
+  normal `message/send` carrying the **same `taskId`** (A2A continuation), which
+  resumes the run. Sending input to a task that isn't waiting returns JSON-RPC
+  `-32004` (mapped to HTTP `409` by the orchestrator).
+- **Everything is persisted** (`data/*.tasks.json`, atomic writes). Close the main
+  agent and come back later: it reloads its task pointers and keeps polling. Kill the
+  automation agent mid-run: on reboot it resumes unfinished tasks *from the last
+  completed step* — progress is never lost. (Both scenarios are asserted by
+  `npm run smoke`, sections 10 and 13.)
+
+The user-facing flow through the orchestrator:
+
+```bash
+# 1. Start — returns at once with a taskId (HTTP 202), work continues remotely
+curl -s -X POST http://localhost:4000/automation -H 'content-type: application/json' \
+  -d '{"agent": "mobile", "task": "Order a veg pizza in the FoodNow app"}' | jq .
+# { "taskId": "...", "state": "working",
+#   "progress": { "phase": "started", "stepsCompleted": 0, "totalSteps": 20, ... } }
+
+# 2. Poll whenever you like — including after restarting the main agent
+curl -s http://localhost:4000/automation/<taskId> | jq '{state, progress}'
+# { "state": "working",
+#   "progress": { "phase": "in-progress", "stepsCompleted": 7, "totalSteps": 20,
+#                 "note": "Step 7/20: Selecting the top result" } }
+
+# 3. Eventually it pauses and tells you what it needs
+# { "state": "input-required",
+#   "inputPrompt": "Enter the OTP shown on the device to continue the automation." }
+curl -s -X POST http://localhost:4000/automation/<taskId>/input \
+  -H 'content-type: application/json' -d '{"input": "123456"}' | jq .state
+# "working" — resumed
+
+# 4. Poll to completion
+curl -s http://localhost:4000/automation/<taskId> | jq '{state, result}'
+# { "state": "completed", "result": "Mobile automation finished: 20/20 UI steps ..." }
+```
+
+Routing note: `POST /automation` names the target agent explicitly, so scoping is a
+deterministic check (does that agent exist and is it up) — the LLM scope gate is only
+needed on `/task`, where the orchestrator must judge free-form requests. The
+automation agents are pure mocks (no LLM): each "step" is a `STEP_MS` sleep plus a
+persisted progress update, which is exactly enough to exercise the protocol
+mechanics — swap the step-runner with real Appium/Playwright calls and the A2A
+surface stays identical.
+
 ## Inspecting a run: the audit log
 
 Every A2A call, LLM call, tool call and guardrail event is one JSON line in
@@ -292,6 +358,8 @@ curl -s -X POST http://localhost:4000/task \
 
 ## What's deliberately out of scope
 
-- Real tool execution (tools return canned data), auth between agents, streaming
-  (`message/stream`), push notifications, persistent task storage, and multi-turn
-  `input-required` continuations — the state exists but is terminal here.
+- Real tool execution and real device/browser automation (everything returns canned
+  data or mock steps), auth between agents, streaming (`message/stream`), and push
+  notifications — polling via `tasks/get` stands in for both.
+- Input-required tasks wait forever (no expiry) and inputs are not idempotent — a
+  production system would add a timeout on the pause and dedupe repeated submissions.

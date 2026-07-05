@@ -17,19 +17,22 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const MOCK_PORT = 12434;
 const LOG_DIR = path.join(ROOT, "logs");
+const DATA_DIR = path.join(ROOT, "data");
 
 const ENV = {
   ...process.env,
   OLLAMA_HOST: `http://127.0.0.1:${MOCK_PORT}`,
   OLLAMA_API_KEY: "",
   LOG_DIR,
+  DATA_DIR,
+  STEP_MS: "150", // fast mock steps so the long-running test stays quick
 };
 
 // ---------------------------------------------------------------------------
 // Process management
 // ---------------------------------------------------------------------------
 
-const children = [];
+const children = new Set();
 
 function launch(name, args) {
   const child = spawn(process.execPath, args, { cwd: ROOT, env: ENV, stdio: ["ignore", "pipe", "pipe"] });
@@ -37,7 +40,18 @@ function launch(name, args) {
     if (process.env.SMOKE_VERBOSE) process.stdout.write(`[${name}] ${d}`);
   });
   child.stderr.on("data", (d) => process.stderr.write(`[${name}!] ${d}`));
-  children.push(child);
+  child.on("exit", () => children.delete(child));
+  children.add(child);
+  return child;
+}
+
+/** Kill a child and wait until its process has actually exited. */
+function stop(child) {
+  return new Promise((resolve) => {
+    if (child.exitCode !== null) return resolve();
+    child.once("exit", resolve);
+    child.kill("SIGTERM");
+  });
 }
 
 process.on("exit", () => children.forEach((c) => c.kill("SIGTERM")));
@@ -93,17 +107,22 @@ async function rpc(port, method, params) {
 // The test run
 // ---------------------------------------------------------------------------
 
-// Fresh logs so the audit-log assertions only see this run.
+// Fresh logs + task stores so the assertions only see this run.
 fs.rmSync(LOG_DIR, { recursive: true, force: true });
+fs.rmSync(DATA_DIR, { recursive: true, force: true });
 
-console.log("Starting mock LLM + 3 agents...");
+console.log("Starting mock LLM + 5 agents...");
 launch("mock-llm", [path.join(ROOT, "scripts/mock-llm.mjs")]);
 launch("executor", ["--import", "tsx", path.join(ROOT, "executor-agent/src/index.ts")]);
 launch("verifier", ["--import", "tsx", path.join(ROOT, "verifier-agent/src/index.ts")]);
-launch("main", ["--import", "tsx", path.join(ROOT, "main-agent/src/index.ts")]);
+let mobileChild = launch("mobile", ["--import", "tsx", path.join(ROOT, "mobile-agent/src/index.ts")]);
+launch("browser", ["--import", "tsx", path.join(ROOT, "browser-agent/src/index.ts")]);
+let mainChild = launch("main", ["--import", "tsx", path.join(ROOT, "main-agent/src/index.ts")]);
 
 await waitFor("http://localhost:4001/.well-known/agent-card.json", "executor card");
 await waitFor("http://localhost:4002/.well-known/agent-card.json", "verifier card");
+await waitFor("http://localhost:4003/.well-known/agent-card.json", "mobile card");
+await waitFor("http://localhost:4004/.well-known/agent-card.json", "browser card");
 await waitFor("http://localhost:4000/healthz", "main agent discovery");
 
 console.log("\n1. Happy path (executor -> verifier fail -> retry -> verifier pass)");
@@ -160,6 +179,129 @@ check("tool allowlist rejection logged (guardrail #3)",
 check("scope-gate rejection logged", readLog("main-agent").includes('"guardrail":"task-scope"'));
 check("injection flag logged", readLog("main-agent").includes('"guardrail":"prompt-injection-scan"'));
 check("inter-agent calls logged with latency", readLog("main-agent").includes('"event":"a2a-call"'));
+
+// ---------------------------------------------------------------------------
+// Long-running automation agents
+// ---------------------------------------------------------------------------
+
+async function getAutomation(id) {
+  const res = await fetch(`http://localhost:4000/automation/${id}`);
+  return { status: res.status, body: await res.json() };
+}
+
+async function pollUntil(id, pred, what, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  let last;
+  while (Date.now() < deadline) {
+    last = await getAutomation(id);
+    if (pred(last.body)) return last;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  throw new Error(`timed out waiting for ${what}; last state: ${JSON.stringify(last?.body)}`);
+}
+
+console.log("\n8. Long-running mobile automation (async A2A + progress polling)");
+const startRes = await fetch("http://localhost:4000/automation", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ agent: "mobile", task: "Order a veg pizza in the FoodNow app and confirm delivery" }),
+});
+const started = await startRes.json();
+check("POST /automation returns immediately with 202 + taskId",
+  startRes.status === 202 && Boolean(started.taskId), `got ${startRes.status}`);
+check('initial phase is "started"/"in-progress"',
+  ["started", "in-progress"].includes(started.progress?.phase), `got ${started.progress?.phase}`);
+const autoId = started.taskId;
+
+const midway = await pollUntil(autoId, (b) => (b.progress?.stepsCompleted ?? 0) >= 3, "some progress");
+check("polling shows steps advancing", midway.body.progress.stepsCompleted >= 3,
+  `steps: ${midway.body.progress.stepsCompleted}`);
+
+console.log("\n9. input-required pause (agent waits for the user's OTP)");
+const paused = await pollUntil(autoId, (b) => b.state === "input-required", "input-required pause");
+check("task pauses in input-required at step 10",
+  paused.body.state === "input-required" && paused.body.progress.stepsCompleted === 10,
+  `state=${paused.body.state} steps=${paused.body.progress.stepsCompleted}`);
+check("inputPrompt tells the user what is needed", /OTP/i.test(paused.body.inputPrompt ?? ""));
+
+console.log("\n10. Persistence: kill the MAIN agent mid-task, restart, progress survives");
+await stop(mainChild);
+mainChild = launch("main", ["--import", "tsx", path.join(ROOT, "main-agent/src/index.ts")]);
+await waitFor("http://localhost:4000/healthz", "main agent after restart");
+const afterRestart = await getAutomation(autoId);
+check("restarted main agent still knows the task (file-backed store)",
+  afterRestart.status === 200 && afterRestart.body.taskId === autoId, `got ${afterRestart.status}`);
+check("state and progress preserved across the restart",
+  afterRestart.body.state === "input-required" && afterRestart.body.progress.stepsCompleted === 10,
+  `state=${afterRestart.body.state} steps=${afterRestart.body.progress?.stepsCompleted}`);
+
+console.log("\n11. A2A continuation: user supplies the OTP, automation resumes and finishes");
+const inputRes = await fetch(`http://localhost:4000/automation/${autoId}/input`, {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ input: "123456" }),
+});
+const inputBody = await inputRes.json();
+check("input accepted, task back to working", inputRes.status === 200 && inputBody.state === "working",
+  `got ${inputRes.status} / ${inputBody.state}`);
+
+const finished = await pollUntil(autoId, (b) => b.state === "completed", "automation completion");
+check("all 20 steps completed", finished.body.progress.stepsCompleted === 20);
+check("result artifact mentions the provided OTP", (finished.body.result ?? "").includes('"123456"'));
+
+const doubleInput = await fetch(`http://localhost:4000/automation/${autoId}/input`, {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ input: "999999" }),
+});
+check("input after completion -> 409 (task not waiting for input)", doubleInput.status === 409,
+  `got ${doubleInput.status}`);
+
+console.log("\n12. Browser agent runs the same protocol (2FA at step 5, 15 steps)");
+const bStart = await (await fetch("http://localhost:4000/automation", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ agent: "browser", task: "Log in to the demo portal and download the invoice" }),
+})).json();
+const bPaused = await pollUntil(bStart.taskId, (b) => b.state === "input-required", "browser 2FA pause");
+check("browser task pauses for 2FA at step 5", bPaused.body.progress.stepsCompleted === 5,
+  `steps=${bPaused.body.progress.stepsCompleted}`);
+await fetch(`http://localhost:4000/automation/${bStart.taskId}/input`, {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ input: "654321" }),
+});
+const bDone = await pollUntil(bStart.taskId, (b) => b.state === "completed", "browser completion");
+check("browser automation completes all 15 steps", bDone.body.progress.stepsCompleted === 15);
+
+console.log("\n13. Sub-agent crash recovery: kill the MOBILE agent mid-run, it resumes from the last step");
+const cStart = await (await fetch("http://localhost:4000/automation", {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ agent: "mobile", task: "Reinstall the demo app and verify its version" }),
+})).json();
+await pollUntil(cStart.taskId, (b) => (b.progress?.stepsCompleted ?? 0) >= 3, "progress before crash");
+const preCrashSteps = (await getAutomation(cStart.taskId)).body.progress.stepsCompleted;
+await stop(mobileChild); // simulate the automation agent crashing mid-task
+mobileChild = launch("mobile", ["--import", "tsx", path.join(ROOT, "mobile-agent/src/index.ts")]);
+await waitFor("http://localhost:4003/.well-known/agent-card.json", "mobile agent after crash");
+const postRestart = await pollUntil(
+  cStart.taskId,
+  (b) => (b.progress?.stepsCompleted ?? 0) >= preCrashSteps,
+  "progress visible after sub-agent restart",
+);
+check("progress resumed from persisted step, not from zero",
+  postRestart.body.progress.stepsCompleted >= preCrashSteps,
+  `pre-crash ${preCrashSteps}, after restart ${postRestart.body.progress.stepsCompleted}`);
+const cPaused = await pollUntil(cStart.taskId, (b) => b.state === "input-required", "OTP pause after crash recovery");
+check("recovered run still pauses for OTP at step 10", cPaused.body.progress.stepsCompleted === 10);
+await fetch(`http://localhost:4000/automation/${cStart.taskId}/input`, {
+  method: "POST",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ input: "777777" }),
+});
+const cDone = await pollUntil(cStart.taskId, (b) => b.state === "completed", "crash-recovered completion");
+check("crash-recovered task completes all 20 steps", cDone.body.progress.stepsCompleted === 20);
 
 console.log(failures === 0 ? "\nAll smoke checks passed." : `\n${failures} smoke check(s) FAILED.`);
 process.exit(failures === 0 ? 0 : 1);

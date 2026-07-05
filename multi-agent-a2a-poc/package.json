@@ -8,6 +8,8 @@
     "start:main": "tsx main-agent/src/index.ts",
     "start:executor": "tsx executor-agent/src/index.ts",
     "start:verifier": "tsx verifier-agent/src/index.ts",
+    "start:mobile": "tsx mobile-agent/src/index.ts",
+    "start:browser": "tsx browser-agent/src/index.ts",
     "mock-llm": "node scripts/mock-llm.mjs",
     "smoke": "node scripts/smoke.mjs",
     "typecheck": "tsc --noEmit"

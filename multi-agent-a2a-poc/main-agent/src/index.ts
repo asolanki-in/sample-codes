@@ -18,7 +18,7 @@
 import "dotenv/config";
 import express from "express";
 import { z } from "zod";
-import { fetchAgentCard, sendMessage } from "../../shared/a2a-client.js";
+import { A2ARemoteError, fetchAgentCard, getTask, sendMessage } from "../../shared/a2a-client.js";
 import { audit, summarize } from "../../shared/audit.js";
 import {
   a2aMessageSchema,
@@ -29,7 +29,7 @@ import {
 } from "../../shared/guardrails.js";
 import { jsonRpcEndpoint, JsonRpcHandlerError } from "../../shared/jsonrpc-server.js";
 import { chat, type ChatMessage } from "../../shared/llm.js";
-import { TaskStore } from "../../shared/task-store.js";
+import { TaskStore, dataFile } from "../../shared/task-store.js";
 import {
   JsonRpcErrorCodes,
   messageText,
@@ -38,6 +38,7 @@ import {
   type A2AMessage,
   type A2ATask,
   type AgentCard,
+  type TaskProgress,
 } from "../../shared/types.js";
 
 const AGENT_NAME = "main-agent";
@@ -45,6 +46,8 @@ const PORT = Number(process.env.MAIN_PORT ?? 4000);
 const PUBLIC_URL = process.env.MAIN_URL ?? `http://localhost:${PORT}`;
 const EXECUTOR_URL = process.env.EXECUTOR_URL ?? "http://localhost:4001";
 const VERIFIER_URL = process.env.VERIFIER_URL ?? "http://localhost:4002";
+const MOBILE_URL = process.env.MOBILE_URL ?? "http://localhost:4003";
+const BROWSER_URL = process.env.BROWSER_URL ?? "http://localhost:4004";
 
 const agentCard: AgentCard = {
   protocolVersion: "1.0",
@@ -68,7 +71,10 @@ const agentCard: AgentCard = {
   security: [],
 };
 
-const taskStore = new TaskStore();
+// File-backed store: the orchestrator's tasks (including which remote agent
+// owns a long-running automation and its remote taskId) survive a restart —
+// close the main agent, come back later, progress is still there.
+const taskStore = new TaskStore(dataFile(AGENT_NAME));
 
 // ---------------------------------------------------------------------------
 // Startup: discover sub-agents via their agent cards (fetched once, cached)
@@ -76,6 +82,13 @@ const taskStore = new TaskStore();
 
 let executorCard: AgentCard;
 let verifierCard: AgentCard;
+
+/** Long-running automation agents, keyed by the name callers use in POST /automation. */
+const automationCards: Record<string, AgentCard | undefined> = {};
+const AUTOMATION_AGENT_URLS: Record<string, string> = {
+  mobile: MOBILE_URL,
+  browser: BROWSER_URL,
+};
 
 async function discoverAgents(): Promise<void> {
   // Sub-agent containers may still be booting; retry discovery a few times.
@@ -96,6 +109,18 @@ async function discoverAgents(): Promise<void> {
     }
   }
   throw new Error("Could not discover sub-agents — are executor/verifier running?");
+}
+
+/** Automation agents are optional: discover what's up, warn about the rest. */
+async function discoverAutomationAgents(): Promise<void> {
+  for (const [key, url] of Object.entries(AUTOMATION_AGENT_URLS)) {
+    try {
+      automationCards[key] = await fetchAgentCard(url);
+      console.log(`[${AGENT_NAME}] discovered automation agent '${key}': ${automationCards[key]!.name} @ ${automationCards[key]!.url}`);
+    } catch {
+      console.warn(`[${AGENT_NAME}] automation agent '${key}' not reachable at ${url} — POST /automation for it will 503`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -450,8 +475,188 @@ app.post(
   }),
 );
 
+// ---------------------------------------------------------------------------
+// Long-running automation flow (mobile / browser agents)
+//
+//   POST /automation            {agent, task}  -> returns taskId immediately
+//   GET  /automation/:id                       -> coarse progress (poll this)
+//   POST /automation/:id/input  {input}        -> answer an input-required pause
+//
+// The sub-agent does the actual long-running work in its own process; the
+// orchestrator only persists a pointer {agent, remoteTaskId} and mirrors the
+// remote task's state on each poll. Because both sides persist to disk, the
+// user can close the main agent, come back later, and continue polling.
+// ---------------------------------------------------------------------------
+
+interface AutomationRef {
+  agent: string;
+  remoteTaskId: string;
+}
+
+/** Mirror the remote task's state machine onto our local task. */
+function syncLocalWithRemote(localId: string, remote: A2ATask): void {
+  const local = taskStore.get(localId)!;
+  taskStore.update(localId, (t) => {
+    t.metadata = { ...t.metadata, progress: remote.metadata?.progress };
+  });
+
+  const localState = local.status.state;
+  const remoteState = remote.status.state;
+  if (localState === remoteState) return;
+
+  if (remoteState === "input-required" && localState === "working") {
+    taskStore.transition(localId, "input-required", remote.status.message);
+  } else if (remoteState === "working" && localState === "input-required") {
+    taskStore.transition(localId, "working");
+  } else if (remoteState === "completed" || remoteState === "failed") {
+    if (localState === "input-required") taskStore.transition(localId, "working");
+    if (remoteState === "completed") taskStore.addArtifact(localId, "result", taskOutputText(remote));
+    taskStore.transition(localId, remoteState, remote.status.message);
+  }
+}
+
+/** Shape both polling and mutation endpoints return to the user. */
+function automationView(localId: string): Record<string, unknown> {
+  const local = taskStore.get(localId)!;
+  const ref = local.metadata?.automation as AutomationRef;
+  const progress = local.metadata?.progress as TaskProgress | undefined;
+  return {
+    taskId: local.id,
+    agent: ref.agent,
+    remoteTaskId: ref.remoteTaskId,
+    state: local.status.state,
+    progress,
+    // When paused, tell the user exactly what the agent is waiting for.
+    inputPrompt: local.status.state === "input-required" ? messageText(local.status.message!) : undefined,
+    result: local.artifacts?.find((a) => a.name === "result")?.parts[0]?.text,
+  };
+}
+
+const automationStartSchema = z.object({
+  agent: z.enum(["mobile", "browser"]),
+  task: z.string().min(1).max(8_000),
+});
+
+app.post(
+  "/automation",
+  rateLimit(AGENT_NAME, 60),
+  validateBody(automationStartSchema, AGENT_NAME), // guardrail #1
+  async (req, res) => {
+    const { agent, task } = req.body as z.infer<typeof automationStartSchema>;
+
+    // Deterministic scope check: the caller names the agent explicitly, so the
+    // only question is whether that agent exists and is up — no LLM needed.
+    const card = automationCards[agent];
+    if (!card) {
+      res.status(503).json({ error: `Automation agent '${agent}' is not available` });
+      return;
+    }
+
+    const inbound = textMessage("user", task);
+    const local = taskStore.create(inbound);
+    scanForInjection(AGENT_NAME, task, local.id); // guardrail #2
+
+    try {
+      // Returns IMMEDIATELY: the remote task is "working", steps run remotely.
+      const remote = await sendMessage(AGENT_NAME, card, task, { contextId: local.contextId });
+      taskStore.transition(local.id, "working");
+      taskStore.update(local.id, (t) => {
+        t.metadata = {
+          ...t.metadata,
+          automation: { agent, remoteTaskId: remote.id } satisfies AutomationRef,
+          progress: remote.metadata?.progress,
+        };
+      });
+      res.status(202).json(automationView(local.id));
+    } catch (err) {
+      console.error(`[${AGENT_NAME}] failed to start automation:`, err);
+      taskStore.transition(local.id, "failed",
+        textMessage("agent", "Could not start the automation task", { taskId: local.id }));
+      res.status(502).json({ taskId: local.id, state: "failed", error: "Could not start the automation task" });
+    }
+  },
+);
+
+app.get("/automation/:id", rateLimit(AGENT_NAME, 300), async (req, res) => {
+  const local = taskStore.get(req.params.id);
+  if (!local) {
+    res.status(404).json({ error: `Unknown automation task: ${req.params.id}` });
+    return;
+  }
+  const ref = local.metadata?.automation as AutomationRef | undefined;
+  if (!ref) {
+    res.status(400).json({ error: "Task is not an automation task" });
+    return;
+  }
+
+  // Terminal locally -> serve the persisted snapshot, no remote call needed.
+  if (local.status.state === "completed" || local.status.state === "failed") {
+    res.json(automationView(local.id));
+    return;
+  }
+
+  const card = automationCards[ref.agent];
+  if (!card) {
+    // Agent temporarily unreachable: still show the LAST KNOWN persisted progress.
+    res.status(200).json({ ...automationView(local.id), warning: `Agent '${ref.agent}' unreachable; showing last known state` });
+    return;
+  }
+
+  try {
+    const remote = await getTask(AGENT_NAME, card, ref.remoteTaskId);
+    syncLocalWithRemote(local.id, remote);
+    res.json(automationView(local.id));
+  } catch (err) {
+    console.error(`[${AGENT_NAME}] poll failed for ${local.id}:`, err);
+    res.status(200).json({ ...automationView(local.id), warning: "Poll failed; showing last known state" });
+  }
+});
+
+const automationInputSchema = z.object({ input: z.string().min(1).max(2_000) });
+
+app.post(
+  "/automation/:id/input",
+  rateLimit(AGENT_NAME, 60),
+  validateBody(automationInputSchema, AGENT_NAME),
+  async (req, res) => {
+    const local = taskStore.get(req.params.id);
+    const ref = local?.metadata?.automation as AutomationRef | undefined;
+    if (!local || !ref) {
+      res.status(404).json({ error: `Unknown automation task: ${req.params.id}` });
+      return;
+    }
+    const card = automationCards[ref.agent];
+    if (!card) {
+      res.status(503).json({ error: `Automation agent '${ref.agent}' is not available` });
+      return;
+    }
+
+    const { input } = req.body as z.infer<typeof automationInputSchema>;
+    scanForInjection(AGENT_NAME, input, local.id); // user input is untrusted too
+
+    try {
+      // A2A continuation: same taskId -> the remote task resumes from its pause.
+      const remote = await sendMessage(AGENT_NAME, card, input, {
+        contextId: local.contextId,
+        taskId: ref.remoteTaskId,
+      });
+      syncLocalWithRemote(local.id, remote);
+      res.json(automationView(local.id));
+    } catch (err) {
+      if (err instanceof A2ARemoteError) {
+        // e.g. task is not waiting for input (double-submit) -> clean 409
+        res.status(409).json({ error: err.message, code: err.code });
+        return;
+      }
+      console.error(`[${AGENT_NAME}] input forwarding failed:`, err);
+      res.status(502).json({ error: "Could not deliver input to the automation agent" });
+    }
+  },
+);
+
 app.listen(PORT, async () => {
   console.log(`[${AGENT_NAME}] listening on :${PORT} — card at ${PUBLIC_URL}/.well-known/agent-card.json`);
   await discoverAgents();
-  console.log(`[${AGENT_NAME}] ready — POST /task to start an orchestration`);
+  await discoverAutomationAgents();
+  console.log(`[${AGENT_NAME}] ready — POST /task (orchestration) or POST /automation (long-running)`);
 });

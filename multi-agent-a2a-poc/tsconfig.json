@@ -10,5 +10,12 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["shared/**/*.ts", "main-agent/**/*.ts", "executor-agent/**/*.ts", "verifier-agent/**/*.ts"]
+  "include": [
+    "shared/**/*.ts",
+    "main-agent/**/*.ts",
+    "executor-agent/**/*.ts",
+    "verifier-agent/**/*.ts",
+    "mobile-agent/**/*.ts",
+    "browser-agent/**/*.ts"
+  ]
 }

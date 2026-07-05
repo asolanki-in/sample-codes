@@ -88,21 +88,26 @@ export class A2ARemoteError extends Error {
 
 /**
  * Send a text message to a remote agent ("message/send").
- * In this PoC message/send blocks until the remote task reaches a terminal
- * state, so the returned task is completed/failed. tasks/get still works for
- * inspecting it afterwards.
+ *
+ * Executor/verifier block until the task is terminal, so the returned task is
+ * completed/failed. The automation agents return immediately (state
+ * "working") and are polled with tasks/get.
+ *
+ * Pass opts.taskId to CONTINUE an existing remote task — that's how user
+ * input reaches a task sitting in "input-required" (A2A continuation).
  */
 export async function sendMessage(
   selfName: string,
   card: AgentCard,
   text: string,
-  opts: { contextId?: string; metadata?: Record<string, unknown> } = {},
+  opts: { contextId?: string; taskId?: string; metadata?: Record<string, unknown> } = {},
 ): Promise<A2ATask> {
   const message: A2AMessage = textMessage("user", text, {
     contextId: opts.contextId,
+    taskId: opts.taskId,
     metadata: opts.metadata,
   });
-  return rpcCall<A2ATask>(selfName, card, "message/send", { message });
+  return rpcCall<A2ATask>(selfName, card, "message/send", { message }, opts.taskId);
 }
 
 /** Poll a task on a remote agent by id ("tasks/get"). */

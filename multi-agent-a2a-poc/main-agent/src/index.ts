@@ -386,6 +386,12 @@ app.use(express.json({ limit: "256kb" }));
 
 app.get("/.well-known/agent-card.json", (_req, res) => res.json(agentCard));
 
+// Readiness probe: 200 once both sub-agent cards are discovered and cached.
+app.get("/healthz", (_req, res) => {
+  const ready = Boolean(executorCard && verifierCard);
+  res.status(ready ? 200 : 503).json({ ready });
+});
+
 // The human-facing entry point.
 const userTaskSchema = z.object({
   task: z.string().min(1).max(8_000),

@@ -68,8 +68,13 @@ export function jsonRpcEndpoint(agentName: string, handlers: Record<string, RpcH
       });
       res.json(success);
     } catch (err) {
-      // Log the full error locally, but never leak internals/stack traces on the wire.
-      console.error(`[${agentName}] handler error for ${method}:`, err);
+      // Expected protocol errors get a one-line log; unexpected errors keep the
+      // full stack — but locally only, nothing internal ever goes on the wire.
+      if (err instanceof JsonRpcHandlerError) {
+        console.warn(`[${agentName}] ${method} -> JSON-RPC error ${err.code}: ${err.message}`);
+      } else {
+        console.error(`[${agentName}] handler error for ${method}:`, err);
+      }
       const code = err instanceof JsonRpcHandlerError ? err.code : JsonRpcErrorCodes.INTERNAL_ERROR;
       const message = err instanceof JsonRpcHandlerError ? err.message : "Internal error";
       const failure: JsonRpcFailure = { jsonrpc: "2.0", id, error: { code, message } };

@@ -43,6 +43,9 @@ multi-agent-a2a-poc/
 │   ├── guardrails.ts             # Zod validation, injection scan, rate limiter
 │   ├── llm.ts                    # raw fetch to {OLLAMA_HOST}/api/chat
 │   └── audit.ts                  # jsonl audit logger
+├── scripts/
+│   ├── mock-llm.mjs              # scripted Ollama mock (for keyless testing)
+│   └── smoke.mjs                 # end-to-end smoke test: npm run smoke
 ├── docker-compose.yml
 ├── Dockerfile
 └── .env.example
@@ -119,6 +122,21 @@ Sample response (from a real run):
 Note the `attempts` array: attempt 1 was rejected by the verifier, so the orchestrator
 retried the executor **once** with the verifier's reason appended to the task text, and
 attempt 2 passed. That whole negotiation happened over A2A `message/send` calls.
+
+## Smoke test — no API key needed
+
+```bash
+npm install
+npm run smoke
+```
+
+This boots a **scripted mock** of the Ollama chat API (`scripts/mock-llm.mjs`) plus all
+three agents, then asserts the full flow end to end: the happy path (including the
+verifier-forced retry), the scope-gate refusal, schema-mismatch 400s, the injection
+flag, raw JSON-RPC `tasks/get` / error codes, the 429 rate limit, and that the
+allowlist/scope/injection events all landed in the audit log. The mock deliberately
+requests a disallowed tool (`delete_everything`) and fails the first verification so
+those guardrail paths are exercised on every run. Exit code 0 = all green.
 
 ## The A2A protocol surface (identical on all three agents)
 
